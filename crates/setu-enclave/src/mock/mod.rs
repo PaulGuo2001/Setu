@@ -166,7 +166,6 @@ impl MockEnclave {
                     .map_err(|e| StfError::InvalidResolvedInputs(format!("Invalid object ID: {}", e)))?;
                 
                 // TODO: Verify Merkle proof here (for production)
-                // let leaf_hash = sha256(entry.value);
                 // verify_proof(leaf_hash, entry.proof, pre_state_root)?;
                 
                 // Deserialize CoinState from BCS (raw storage format)
