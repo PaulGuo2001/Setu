@@ -1018,6 +1018,11 @@ impl GlobalStateManager {
         }
         // Fallback: use BLAKE3 hash instead of SHA256 to produce a deterministic value
         // This path should never be hit in correct code after key format unification
+        debug_assert!(
+            false,
+            "parse_state_change_key: unexpected key format '{}'. All keys should use 'oid:' prefix.",
+            key
+        );
         let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
         HashValue::from_slice(&hash).expect("32 bytes")
     }
@@ -1229,25 +1234,19 @@ mod tests {
     }
     
     #[test]
+    #[should_panic(expected = "unexpected key format")]
     fn test_parse_state_change_key_legacy_format() {
-        // Test legacy format - should BLAKE3 hash the key (SHA256 fallback removed)
+        // Legacy format without "oid:" prefix should panic (debug_assert)
         let key = "event:some-event-id";
-        let parsed = GlobalStateManager::parse_state_change_key(key);
-        
-        // Verify it matches BLAKE3 hash fallback
-        let expected = setu_types::hash_utils::setu_hash(key.as_bytes());
-        assert_eq!(parsed, HashValue::from_slice(&expected).unwrap());
+        let _parsed = GlobalStateManager::parse_state_change_key(key);
     }
     
     #[test]
+    #[should_panic(expected = "unexpected key format")]
     fn test_parse_state_change_key_invalid_oid() {
-        // Test invalid oid format - should fall back to BLAKE3 hash
+        // Invalid oid format should panic (debug_assert)
         let key = "oid:not-valid-hex";
-        let parsed = GlobalStateManager::parse_state_change_key(key);
-        
-        // Should BLAKE3 hash the whole key as fallback
-        let expected = setu_types::hash_utils::setu_hash(key.as_bytes());
-        assert_eq!(parsed, HashValue::from_slice(&expected).unwrap());
+        let _parsed = GlobalStateManager::parse_state_change_key(key);
     }
     
     #[test]
