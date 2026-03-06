@@ -65,7 +65,6 @@ pub fn print_report(summary: &BenchmarkSummary) {
 }
 
 /// Generate JSON report
-#[allow(dead_code)]
 pub fn json_report(summary: &BenchmarkSummary) -> String {
     serde_json::json!({
         "total_requests": summary.total_requests,

@@ -4,7 +4,6 @@
 //! They form a DAG (Directed Acyclic Graph) with causal ordering.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
 
 // Re-export VLC types from setu-vlc (single source of truth)
 pub use setu_vlc::{VectorClock, VLCSnapshot};
@@ -422,14 +421,15 @@ impl Event {
         creator: &str,
         timestamp: u64,
     ) -> EventId {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_EVENT_ID:");
         for parent_id in parent_ids {
             hasher.update(parent_id.as_bytes());
         }
-        hasher.update(vlc_snapshot.logical_time.to_le_bytes());
+        hasher.update(&vlc_snapshot.logical_time.to_le_bytes());
         hasher.update(creator.as_bytes());
-        hasher.update(timestamp.to_le_bytes());
-        hex::encode(hasher.finalize())
+        hasher.update(&timestamp.to_le_bytes());
+        hex::encode(hasher.finalize().as_bytes())
     }
     
     /// Verify that the event ID matches the content (anti-tampering check)
@@ -560,7 +560,7 @@ impl Event {
             EventPayload::None => vec![],
             EventPayload::Genesis(g) => {
                 g.accounts.iter()
-                    .map(|a| format!("account:{}", a.name))
+                    .map(|a| format!("account:{}", a.address))
                     .collect()
             }
         }

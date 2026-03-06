@@ -306,28 +306,26 @@ impl StateDiff {
         self.writes.len() + self.deletes.len()
     }
     
-    /// Compute commitment hash of this state diff
+    /// Compute commitment hash of this state diff.
+    ///
+    /// Uses the canonical `hash_utils::compute_write_set_commitment` to ensure
+    /// validator and enclave produce identical commitments.
     pub fn commitment(&self) -> Hash {
-        use sha2::{Sha256, Digest};
-        
-        let mut hasher = Sha256::new();
-        
-        // Hash writes
-        for write in &self.writes {
-            hasher.update(write.key.as_bytes());
-            hasher.update(&write.new_value);
-        }
-        
-        // Hash deletes
-        for delete in &self.deletes {
-            hasher.update(b"DELETE:");
-            hasher.update(delete.as_bytes());
-        }
-        
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
+        let changes: Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)> = self
+            .writes
+            .iter()
+            .map(|w| (
+                w.key.clone(),
+                w.old_value.clone(),
+                Some(w.new_value.clone()),
+            ))
+            .chain(self.deletes.iter().map(|d| (
+                d.clone(),
+                None,  // old_value unknown for deletes in this context
+                None,  // new_value = None signals deletion
+            )))
+            .collect();
+        setu_types::hash_utils::compute_write_set_commitment(&changes)
     }
 }
 

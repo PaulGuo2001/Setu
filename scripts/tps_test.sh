@@ -40,10 +40,14 @@ WARMUP_REQUESTS=50        # 预热请求数
 USE_TEST_ACCOUNTS=true    # 使用测试账户
 INIT_ACCOUNTS=100         # 初始化测试账户数量 (0=不初始化，使用种子账户)
 INIT_ACCOUNT_BALANCE=100000  # 每个测试账户的初始余额
-COINS_PER_ACCOUNT=1       # 每个账户的 coin 对象数 (更多=更高单账户并发)
+COINS_PER_ACCOUNT=2       # 每个账户的 coin 对象数 (更多=更高单账户并发, 建议≥2)
 BENCHMARK_MODE="burst"    # 模式: burst, sustained, ramp
 SUSTAINED_DURATION=30     # sustained 模式持续时间(秒)
 SUSTAINED_TPS=100         # sustained 模式目标 TPS
+RAMP_START=10             # ramp 模式起始 TPS
+RAMP_STEP=10              # ramp 模式每步递增 TPS
+RAMP_STEP_DURATION=10     # ramp 模式每步持续时间(秒)
+RAMP_DURATION=60          # ramp 模式总时间(秒)
 USE_BATCH=false           # 使用批量 API
 BATCH_SIZE=50             # 批量大小
 
@@ -99,6 +103,10 @@ Benchmark 模式:
   --sustained-duration S  持续模式时长 (默认: $SUSTAINED_DURATION 秒)
   --sustained-tps TPS     持续模式目标 TPS (默认: $SUSTAINED_TPS)
   --ramp                  渐进模式
+  --ramp-start TPS        渐进模式起始 TPS (默认: $RAMP_START)
+  --ramp-step TPS         渐进模式每步递增 TPS (默认: $RAMP_STEP)
+  --ramp-step-duration S  渐进模式每步持续时间 (默认: $RAMP_STEP_DURATION 秒)
+  --ramp-duration S       渐进模式总持续时间 (默认: $RAMP_DURATION 秒)
   --batch                 启用批量 API 模式
   --batch-size SIZE       批量大小 (默认: $BATCH_SIZE)
 
@@ -193,6 +201,22 @@ while [[ $# -gt 0 ]]; do
             BENCHMARK_MODE="ramp"
             shift
             ;;
+        --ramp-start)
+            RAMP_START="$2"
+            shift 2
+            ;;
+        --ramp-step)
+            RAMP_STEP="$2"
+            shift 2
+            ;;
+        --ramp-step-duration)
+            RAMP_STEP_DURATION="$2"
+            shift 2
+            ;;
+        --ramp-duration)
+            RAMP_DURATION="$2"
+            shift 2
+            ;;
         --batch)
             USE_BATCH=true
             shift
@@ -270,6 +294,10 @@ create_log_dir() {
         "coins_per_account": ${COINS_PER_ACCOUNT},
         "sustained_duration": ${SUSTAINED_DURATION},
         "sustained_tps": ${SUSTAINED_TPS},
+        "ramp_start": ${RAMP_START},
+        "ramp_step": ${RAMP_STEP},
+        "ramp_step_duration": ${RAMP_STEP_DURATION},
+        "ramp_duration": ${RAMP_DURATION},
         "use_batch": ${USE_BATCH},
         "batch_size": ${BATCH_SIZE}
     },
@@ -320,6 +348,16 @@ cleanup_processes() {
 # ============================================================================
 cleanup_database() {
     log_step "清理数据库"
+    # 确认无残留进程占用数据库
+    local retries=0
+    while [ $retries -lt 5 ]; do
+        if ! pgrep -f "setu-validator" >/dev/null 2>&1 && ! pgrep -f "setu-solver" >/dev/null 2>&1; then
+            break
+        fi
+        retries=$((retries + 1))
+        log_info "等待进程完全退出... ($retries/5)"
+        sleep 1
+    done
     rm -rf "${PROJECT_ROOT}/example_db"
     log_ok "数据库已清理"
 }
@@ -426,6 +464,18 @@ start_solvers() {
 run_benchmark() {
     log_step "运行 Benchmark 测试"
     
+    # 检查 Validator 进程是否仍在运行
+    if [ -f "${TEST_LOG_DIR}/validator.pid" ]; then
+        local vpid=$(cat "${TEST_LOG_DIR}/validator.pid")
+        if ! kill -0 "$vpid" 2>/dev/null; then
+            log_error "Validator 进程(PID: $vpid)已退出!"
+            log_error "最后 20 行日志:"
+            tail -20 "${VALIDATOR_LOG}" 2>/dev/null
+            exit 1
+        fi
+        log_ok "Validator 进程(PID: $vpid)运行中"
+    fi
+    
     local benchmark_args="-t ${TOTAL_REQUESTS} -c ${CONCURRENCY}"
     
     if [ "$USE_TEST_ACCOUNTS" = true ]; then
@@ -452,7 +502,7 @@ run_benchmark() {
             benchmark_args="${benchmark_args} -m sustained --duration ${SUSTAINED_DURATION} --target-tps ${SUSTAINED_TPS}"
             ;;
         ramp)
-            benchmark_args="${benchmark_args} -m ramp"
+            benchmark_args="${benchmark_args} -m ramp --duration ${RAMP_DURATION} --ramp-start ${RAMP_START} --ramp-step ${RAMP_STEP} --ramp-step-duration ${RAMP_STEP_DURATION}"
             ;;
         *)
             # burst 模式是默认
@@ -589,11 +639,49 @@ show_config() {
         echo "  持续时间:       ${SUSTAINED_DURATION}s"
         echo "  目标 TPS:       ${SUSTAINED_TPS}"
     fi
+    if [ "$BENCHMARK_MODE" = "ramp" ]; then
+        echo "  渐进起始TPS:    ${RAMP_START}"
+        echo "  渐进递增:       ${RAMP_STEP} TPS/步"
+        echo "  每步时长:       ${RAMP_STEP_DURATION}s"
+        echo "  总时长:         ${RAMP_DURATION}s"
+    fi
     echo ""
     echo "日志配置:"
     echo "  日志级别:       ${RUST_LOG_LEVEL}"
     echo "  日志目录:       ${TEST_LOG_DIR}"
     echo "=============================================="
+}
+
+# ============================================================================
+# 配置验证
+# ============================================================================
+validate_config() {
+    log_step "验证配置"
+    local warnings=0
+    
+    # 检查 INIT_ACCOUNTS 与 CONCURRENCY 的比例
+    if [ "$INIT_ACCOUNTS" -gt 0 ] && [ "$INIT_ACCOUNTS" -lt "$CONCURRENCY" ]; then
+        log_warn "INIT_ACCOUNTS($INIT_ACCOUNTS) < CONCURRENCY($CONCURRENCY): coin 争用率高，建议 INIT_ACCOUNTS >= CONCURRENCY * 2"
+        warnings=$((warnings + 1))
+    fi
+    
+    # 检查 COINS_PER_ACCOUNT
+    if [ "$INIT_ACCOUNTS" -gt 0 ] && [ "$COINS_PER_ACCOUNT" -lt 2 ] && [ "$CONCURRENCY" -gt "$INIT_ACCOUNTS" ]; then
+        log_warn "COINS_PER_ACCOUNT($COINS_PER_ACCOUNT) 较低且并发超过账户数，建议增加至 >= 2"
+        warnings=$((warnings + 1))
+    fi
+    
+    # 检查预热数量不超过总请求数
+    if [ "$WARMUP_REQUESTS" -ge "$TOTAL_REQUESTS" ]; then
+        log_warn "WARMUP_REQUESTS($WARMUP_REQUESTS) >= TOTAL_REQUESTS($TOTAL_REQUESTS): 预热数量过大"
+        warnings=$((warnings + 1))
+    fi
+    
+    if [ $warnings -eq 0 ]; then
+        log_ok "配置验证通过"
+    else
+        log_warn "发现 ${warnings} 个配置警告 (继续执行)"
+    fi
 }
 
 # ============================================================================
@@ -625,6 +713,7 @@ main() {
     # 执行测试流程
     disable_proxy
     create_log_dir
+    validate_config
     cleanup_processes
     cleanup_database
     start_validator

@@ -340,8 +340,10 @@ impl<S: StateStore> RuntimeExecutor<S> {
         amount: Option<u64>,
         ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
-        let sender_addr = Address::from(sender);
-        let recipient_addr = Address::from(recipient);
+        let sender_addr = Address::from_hex(sender)
+            .map_err(|_| RuntimeError::InvalidAddress(sender.to_string()))?;
+        let recipient_addr = Address::from_hex(recipient)
+            .map_err(|_| RuntimeError::InvalidAddress(recipient.to_string()))?;
         
         info!(
             coin_id = %coin_id,
@@ -394,8 +396,10 @@ impl<S: StateStore> RuntimeExecutor<S> {
         amount: u64,
         ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
-        let sender = Address::from(from);
-        let recipient = Address::from(to);
+        let sender = Address::from_hex(from)
+            .map_err(|_| RuntimeError::InvalidAddress(from.to_string()))?;
+        let recipient = Address::from_hex(to)
+            .map_err(|_| RuntimeError::InvalidAddress(to.to_string()))?;
         
         info!(
             from = %from,
@@ -497,11 +501,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
         });
         
         // Generate deterministic ObjectId from subnet key
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(subnet_key.as_bytes());
-        let hash: [u8; 32] = hasher.finalize().into();
-        let subnet_object_id = ObjectId::new(hash);
+        let hash = blake3::hash(subnet_key.as_bytes());
+        let subnet_object_id = ObjectId::new(*hash.as_bytes());
         
         // Note: SubnetMetadata is NOT a Coin, so we keep JSON format for it
         // Only Coin objects use BCS format
@@ -597,11 +598,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
         });
         
         // Generate deterministic ObjectId from membership key
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(membership_key.as_bytes());
-        let hash: [u8; 32] = hasher.finalize().into();
-        let membership_object_id = ObjectId::new(hash);
+        let hash = blake3::hash(membership_key.as_bytes());
+        let membership_object_id = ObjectId::new(*hash.as_bytes());
         
         state_changes.push(StateChange {
             change_type: StateChangeType::Create,
@@ -763,8 +761,8 @@ mod tests {
     #[test]
     fn test_full_transfer() {
         let mut store = InMemoryStateStore::new();
-        let sender = Address::from("alice");
-        let recipient = Address::from("bob");
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
         
         // 创建初始 Coin
         let coin = setu_types::create_coin(sender.clone(), 1000);
@@ -797,8 +795,8 @@ mod tests {
     #[test]
     fn test_partial_transfer() {
         let mut store = InMemoryStateStore::new();
-        let sender = Address::from("alice");
-        let recipient = Address::from("bob");
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
         
         let coin = setu_types::create_coin(sender.clone(), 1000);
         let coin_id = *coin.id();

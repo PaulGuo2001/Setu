@@ -91,17 +91,10 @@ impl AnchorStore {
         })
     }
     
-    /// Chain hash: combines previous chain root with new anchor hash
-    /// new_root = SHA256(prev_root || anchor_hash)
+    /// Chain hash: combines previous chain root with new anchor hash.
+    /// Delegates to the canonical implementation in `hash_utils::chain_hash`.
     fn chain_hash(prev_root: &[u8; 32], anchor_hash: &[u8; 32]) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(prev_root);
-        hasher.update(anchor_hash);
-        let result = hasher.finalize();
-        let mut output = [0u8; 32];
-        output.copy_from_slice(&result);
-        output
+        setu_types::hash_utils::chain_hash(prev_root, anchor_hash)
     }
     
     // =========================================================================

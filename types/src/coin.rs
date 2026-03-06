@@ -14,7 +14,6 @@
 //! - Enclave passes through the bytes without parsing
 
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
 use crate::object::{Object, Address, ObjectId, generate_object_id};
 
 // ============================================================================
@@ -303,24 +302,24 @@ pub fn create_typed_coin(owner: Address, value: u64, coin_type: impl Into<String
 /// # Returns
 /// Deterministic 32-byte ObjectId
 pub fn deterministic_coin_id(owner: &Address, subnet_id: &str) -> ObjectId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"coin:");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"SETU_COIN_ID:");
     hasher.update(owner.to_string().as_bytes());
     hasher.update(b":");
     hasher.update(subnet_id.as_bytes());
-    ObjectId::new(hasher.finalize().into())
+    ObjectId::new(*hasher.finalize().as_bytes())
 }
 
 /// Generate deterministic coin ObjectId from string address
 /// 
 /// Convenience function for when you have a string address instead of Address.
 pub fn deterministic_coin_id_from_str(owner: &str, subnet_id: &str) -> ObjectId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"coin:");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"SETU_COIN_ID:");
     hasher.update(owner.as_bytes());
     hasher.update(b":");
     hasher.update(subnet_id.as_bytes());
-    ObjectId::new(hasher.finalize().into())
+    ObjectId::new(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]

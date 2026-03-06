@@ -24,6 +24,7 @@ bcs = "0.1"
 
 # Crypto
 sha2 = "0.10"
+blake3 = "1.5"
 rand = "0.8"
 
 # Async

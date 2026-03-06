@@ -249,14 +249,16 @@ impl MerkleStateProvider {
         // Pre-compute ALL coin object IDs (NO LOCK - pure computation)
         //
         // coin_namespace = subnet_id directly (ROOT or subnet name)
-        // coin_object_id = SHA256("coin:" + address + ":" + coin_namespace)
+        // coin_object_id = BLAKE3("SETU_COIN_ID:" + canonical_address + ":" + coin_namespace)
         // ══════════════════════════════════════════════════════════════════
         let coin_queries: Vec<CoinQuery> = sender_subnet_pairs
             .iter()
             .map(|(sender, subnet_id)| {
+                // Canonicalize sender to hex address format
+                let canonical_sender = crate::state::provider::resolve_owner_address(sender);
                 // Use coin_namespace_string to get the correct namespace for ALL subnets
                 let coin_namespace = Self::coin_namespace_string(subnet_id);
-                let object_id_bytes = Self::coin_object_id_with_type(sender, &coin_namespace);
+                let object_id_bytes = Self::coin_object_id_with_type(&canonical_sender, &coin_namespace);
                 CoinQuery {
                     sender: sender.to_string(),
                     subnet_id: (*subnet_id).clone(),

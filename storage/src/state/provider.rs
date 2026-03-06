@@ -25,7 +25,6 @@
 use crate::state::manager::GlobalStateManager;
 use setu_merkle::{HashValue, SparseMerkleProof};
 use setu_types::{ObjectId, SubnetId};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::debug;
@@ -253,22 +252,14 @@ impl MerkleStateProvider {
     // ------------------------------------------------------------------------
 
     /// Generate object ID for a coin owned by an address with specific coin type
-    /// 
-    /// Convention: coin_object_id = SHA256("coin:" || address || ":" || subnet_id)
-    /// 
-    /// Each address can hold coins in different subnets (1 subnet = 1 native token).
-    /// The subnet_id is used as the coin namespace.
-    /// 
-    /// Examples:
-    /// - ROOT subnet: SHA256("coin:alice:ROOT")
-    /// - gaming subnet: SHA256("coin:alice:gaming-subnet")
+    ///
+    /// Accepts canonical hex form ("0x" + 64 hex chars). In test builds,
+    /// also accepts plain names (e.g., "alice") via `from_str_id`.
+    ///
+    /// Delegates to the canonical implementation in `setu_types::coin::deterministic_coin_id_from_str`.
     pub fn coin_object_id_with_type(address: &str, subnet_id: &str) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"coin:");
-        hasher.update(address.as_bytes());
-        hasher.update(b":");
-        hasher.update(subnet_id.as_bytes());
-        hasher.finalize().into()
+        let canonical = resolve_owner_address(address);
+        *setu_types::deterministic_coin_id_from_str(&canonical, subnet_id).as_bytes()
     }
 
     /// Generate object ID for ROOT subnet coin
@@ -339,11 +330,8 @@ impl MerkleStateProvider {
 
 impl StateProvider for MerkleStateProvider {
     fn get_coins_for_address(&self, address: &str) -> Vec<CoinInfo> {
-        use setu_types::Address;
-        
-        // Normalize address to hex format ("0x...") for consistency.
-        // All indices use hex address as the canonical key.
-        let addr_hex = Address::from(address).to_string();
+        // Canonicalize address to lowercase hex format ("0x...").
+        let addr_hex = resolve_owner_address(address);
         
         // Use owner_coin_index to find all (object_id, coin_type) pairs for this owner.
         // This works for both deterministic init coins AND runtime split coins.
@@ -430,6 +418,30 @@ impl StateProvider for MerkleStateProvider {
 // Utility Functions for State Initialization
 // ============================================================================
 
+/// Resolve an owner string to a canonical hex address.
+///
+/// In production: only accepts valid hex addresses ("0x" + 64 hex chars).
+/// In test builds: also accepts plain names (e.g., "alice") via `Address::from_str_id`.
+pub(crate) fn resolve_owner_address(owner: &str) -> String {
+    use setu_types::Address;
+    
+    // Try hex first
+    if let Ok(addr) = Address::from_hex(owner) {
+        return addr.to_string();
+    }
+    
+    // In test builds, fall back to from_str_id
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        return Address::from_str_id(owner).to_string();
+    }
+    
+    #[cfg(not(any(test, feature = "test-utils")))]
+    {
+        panic!("resolve_owner_address: invalid hex address '{}'. In production, only hex addresses are accepted.", owner);
+    }
+}
+
 /// Initialize a coin in the state (for testing/genesis)
 /// Uses ROOT subnet (native SETU token)
 pub fn init_coin(
@@ -457,15 +469,8 @@ pub fn init_coin_with_type(
     balance: u64,
     subnet_id: &str,
 ) -> ObjectId {
-    use setu_types::Address;
-    
-    // Normalize owner to hex address format ("0x...") for consistency.
-    // Runtime always uses Address::from(s).to_string() as the canonical owner format.
-    // We must use the same format for:
-    //   1. CoinState.owner (stored in SMT)
-    //   2. coin_object_id computation
-    //   3. coin_type_index key
-    let owner_hex = Address::from(owner).to_string();
+    // Canonicalize owner to hex address format ("0x...").
+    let owner_hex = resolve_owner_address(owner);
     
     let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(&owner_hex, subnet_id);
     let coin_state = CoinState::new_with_type(owner_hex.clone(), balance, subnet_id.to_string());
@@ -513,7 +518,7 @@ pub fn init_coin_with_provider(
         init_coin_with_type(&mut manager, owner, balance, subnet_id)
     };
     
-    // Auto-register to index
+    // Auto-register to index (GSM normalizes the address internally)
     provider.register_coin_type(owner, subnet_id);
     
     object_id
@@ -536,6 +541,7 @@ pub fn get_or_create_coin(
     owner: &str,
     subnet_id: &str,
 ) -> (ObjectId, bool) {
+    // coin_object_id_with_type normalizes the address internally
     let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(owner, subnet_id);
     let object_id = ObjectId::new(object_id_bytes);
     
@@ -608,7 +614,9 @@ mod tests {
         // Query by ROOT subnet (not SETU)
         let coins = provider.get_coins_for_address_by_type("alice", "ROOT");
         assert_eq!(coins.len(), 1);
-        assert_eq!(coins[0].owner, "alice");
+        // CoinState.owner stores the canonical hex address
+        let canonical_alice = setu_types::Address::from_str_id("alice").to_string();
+        assert_eq!(coins[0].owner, canonical_alice);
         assert_eq!(coins[0].balance, 1000);
 
         // Verify we can get proof

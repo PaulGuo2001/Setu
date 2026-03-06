@@ -222,13 +222,8 @@ mod tests {
     use super::*;
     
     fn make_subnet_id(name: &str) -> SubnetId {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(name.as_bytes());
-        let result = hasher.finalize();
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&result);
-        id
+        let hash = blake3::hash(name.as_bytes());
+        *hash.as_bytes()
     }
     
     #[test]

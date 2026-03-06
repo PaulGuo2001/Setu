@@ -27,7 +27,6 @@ uuid = { version = "1.6", features = ["v4"] }
 
 # Hashing for consistent routing
 blake3 = "1.5"
-sha2 = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"

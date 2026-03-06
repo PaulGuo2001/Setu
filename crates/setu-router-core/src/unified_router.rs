@@ -285,26 +285,15 @@ pub struct DetailedRoutingResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Sha256, Digest};
     
     fn make_object_id(name: &str) -> ObjectId {
-        let mut hasher = Sha256::new();
-        hasher.update(b"OBJECT:");
-        hasher.update(name.as_bytes());
-        let result = hasher.finalize();
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&result);
-        id
+        let hash = blake3::hash(format!("OBJECT:{}", name).as_bytes());
+        *hash.as_bytes()
     }
     
     fn make_subnet_id(name: &str) -> SubnetId {
-        let mut hasher = Sha256::new();
-        hasher.update(b"SUBNET:");
-        hasher.update(name.as_bytes());
-        let result = hasher.finalize();
-        let mut id = [0u8; 32];
-        id.copy_from_slice(&result);
-        id
+        let hash = blake3::hash(format!("SUBNET:{}", name).as_bytes());
+        *hash.as_bytes()
     }
     
     #[test]

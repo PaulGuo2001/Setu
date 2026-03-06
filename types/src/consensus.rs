@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 
 use crate::event::{EventId, VLCSnapshot};
@@ -91,14 +90,15 @@ impl Anchor {
         state_root: &str,
         timestamp: u64,
     ) -> AnchorId {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_ANCHOR_ID:");
         for event_id in event_ids {
             hasher.update(event_id.as_bytes());
         }
-        hasher.update(vlc_snapshot.logical_time.to_le_bytes());
+        hasher.update(&vlc_snapshot.logical_time.to_le_bytes());
         hasher.update(state_root.as_bytes());
-        hasher.update(timestamp.to_le_bytes());
-        hex::encode(hasher.finalize())
+        hasher.update(&timestamp.to_le_bytes());
+        hex::encode(hasher.finalize().as_bytes())
     }
 
     pub fn event_count(&self) -> usize {
@@ -139,26 +139,21 @@ impl Anchor {
     /// - events_root, global_state_root, anchor_chain_root (Merkle commitments)
     /// - vlc_snapshot, timestamp (ordering)
     pub fn compute_hash(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_ANCHOR_HASH:");
         hasher.update(self.id.as_bytes());
-        hasher.update(self.depth.to_le_bytes());
+        hasher.update(&self.depth.to_le_bytes());
         if let Some(prev) = &self.previous_anchor {
             hasher.update(prev.as_bytes());
         }
         if let Some(roots) = &self.merkle_roots {
             hasher.update(&roots.events_root);
             hasher.update(&roots.global_state_root);
-            // Include anchor_chain_root to commit to the entire history
-            // This ensures anchors with different histories produce different hashes
             hasher.update(&roots.anchor_chain_root);
         }
-        hasher.update(self.vlc_snapshot.logical_time.to_le_bytes());
-        hasher.update(self.timestamp.to_le_bytes());
-        
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
+        hasher.update(&self.vlc_snapshot.logical_time.to_le_bytes());
+        hasher.update(&self.timestamp.to_le_bytes());
+        *hasher.finalize().as_bytes()
     }
 }
 
@@ -309,11 +304,12 @@ impl ConsensusFrame {
     }
 
     fn compute_id(anchor: &Anchor, proposer: &str, timestamp: u64) -> CFId {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_CF_ID:");
         hasher.update(anchor.id.as_bytes());
         hasher.update(proposer.as_bytes());
-        hasher.update(timestamp.to_le_bytes());
-        hex::encode(hasher.finalize())
+        hasher.update(&timestamp.to_le_bytes());
+        hex::encode(hasher.finalize().as_bytes())
     }
 
     pub fn add_vote(&mut self, vote: Vote) {

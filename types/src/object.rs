@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
 use std::fmt;
 use std::str::FromStr;
 
@@ -30,10 +29,9 @@ impl ObjectId {
     }
     
     pub fn random() -> Self {
-        use sha2::Digest;
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(
-            std::time::SystemTime::now()
+            &std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
@@ -41,11 +39,8 @@ impl ObjectId {
         );
         // Add some entropy from memory address
         let entropy: usize = &hasher as *const _ as usize;
-        hasher.update(entropy.to_le_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Self(bytes)
+        hasher.update(&entropy.to_le_bytes());
+        ObjectId::new(*hasher.finalize().as_bytes())
     }
     
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -135,14 +130,14 @@ impl Address {
         Self::from_bytes(&bytes)
     }
     
-    /// Create address from a string identifier (hashes the string)
+    /// Create address from a string identifier (hashes the string with BLAKE3).
+    ///
+    /// **Test-only**: In production, addresses MUST be derived from public keys
+    /// via `setu-keys::derive_address_from_secp256k1` or `derive_address_from_nostr_pubkey`.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn from_str_id(id: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(id.as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Self(bytes)
+        let hash = blake3::hash(id.as_bytes());
+        Self(*hash.as_bytes())
     }
     
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -171,12 +166,6 @@ impl FromStr for Address {
     
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_hex(s)
-    }
-}
-
-impl From<&str> for Address {
-    fn from(s: &str) -> Self {
-        Self::from_str_id(s)
     }
 }
 
@@ -388,16 +377,14 @@ impl<T: Serialize + Clone> Object<T> {
     
     /// Compute and update the object digest
     pub fn compute_digest(&mut self) {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_OBJ_DIGEST:");
         hasher.update(self.metadata.id.as_bytes());
-        hasher.update(self.metadata.version.to_le_bytes());
+        hasher.update(&self.metadata.version.to_le_bytes());
         if let Ok(data_bytes) = bcs::to_bytes(&self.data) {
             hasher.update(&data_bytes);
         }
-        let result = hasher.finalize();
-        let mut digest_bytes = [0u8; 32];
-        digest_bytes.copy_from_slice(&result);
-        self.metadata.digest = ObjectDigest::new(digest_bytes);
+        self.metadata.digest = ObjectDigest::new(*hasher.finalize().as_bytes());
     }
 
     pub fn increment_version(&mut self) {
@@ -419,19 +406,17 @@ impl<T: Serialize + Clone> Object<T> {
 }
 
 pub fn generate_object_id(seed: &[u8]) -> ObjectId {
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"SETU_GEN_OID:");
     hasher.update(seed);
     hasher.update(
-        std::time::SystemTime::now()
+        &std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
             .to_le_bytes(),
     );
-    let result = hasher.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&result);
-    ObjectId::new(bytes)
+    ObjectId::new(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]

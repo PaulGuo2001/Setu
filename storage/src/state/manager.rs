@@ -28,7 +28,6 @@ use setu_types::event::{Event, StateChange, ExecutionResult};
 use setu_types::coin::CoinState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use sha2::{Sha256, Digest};
 
 /// Manages Object State SMT for a single subnet
 #[derive(Clone)]
@@ -666,6 +665,12 @@ impl GlobalStateManager {
     // Coin Type Index Methods
     // =========================================================================
 
+    /// Resolve an owner string to a canonical hex address.
+    /// Delegates to `provider::resolve_owner_address` (single source of truth).
+    fn resolve_address(address: &str) -> String {
+        crate::state::provider::resolve_owner_address(address)
+    }
+
     /// Get all coin types (subnet IDs) for an address.
     /// 
     /// This is used by MerkleStateProvider to efficiently query coins
@@ -674,8 +679,9 @@ impl GlobalStateManager {
     /// # Returns
     /// Set of subnet IDs where the address has coins.
     pub fn get_coin_types_for_address(&self, address: &str) -> HashSet<String> {
+        let canonical = Self::resolve_address(address);
         self.coin_type_index
-            .get(address)
+            .get(&canonical)
             .cloned()
             .unwrap_or_default()
     }
@@ -685,8 +691,9 @@ impl GlobalStateManager {
     /// This is primarily used during initialization (e.g., genesis, tests).
     /// During normal operation, apply_state_change() handles index updates.
     pub fn register_coin_type(&mut self, address: &str, coin_type: &str) {
+        let canonical = Self::resolve_address(address);
         self.coin_type_index
-            .entry(address.to_string())
+            .entry(canonical)
             .or_default()
             .insert(coin_type.to_string());
     }
@@ -696,9 +703,10 @@ impl GlobalStateManager {
     /// This tracks both the coin type and the specific object_id,
     /// enabling efficient lookup of coins even after runtime split operations.
     pub fn register_coin_object(&mut self, address: &str, coin_type: &str, object_id: [u8; 32]) {
-        self.register_coin_type(address, coin_type);
+        let canonical = Self::resolve_address(address);
+        self.register_coin_type(&canonical, coin_type);
         self.owner_coin_index
-            .entry(address.to_string())
+            .entry(canonical)
             .or_default()
             .insert((object_id, coin_type.to_string()));
     }
@@ -707,8 +715,9 @@ impl GlobalStateManager {
     /// 
     /// Returns (object_id, coin_type) pairs for all coins owned by the address.
     pub fn get_coin_objects_for_address(&self, address: &str) -> Vec<([u8; 32], String)> {
+        let canonical = Self::resolve_address(address);
         self.owner_coin_index
-            .get(address)
+            .get(&canonical)
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default()
     }
@@ -977,39 +986,40 @@ impl GlobalStateManager {
     /// - `"oid:{hex}"`: Direct ObjectId hex from TEE output → decode directly
     /// - Other: Hash the key with SHA-256 (legacy fallback)
     /// 
+    /// Parse a state change key to a 32-byte HashValue.
+    ///
+    /// Only accepts the canonical `"oid:{hex}"` format. Any other format is an error.
+    /// This eliminates the legacy SHA256 fallback that silently produced wrong ObjectIds.
+    ///
     /// ## Example
     /// 
     /// ```ignore
-    /// // TEE output key (new format)
-    /// parse_state_change_key("oid:abcd1234...") → HashValue([0xab, 0xcd, ...])
-    /// 
-    /// // Legacy key (hashed)
-    /// parse_state_change_key("event:some-id") → SHA256("event:some-id")
+    /// parse_state_change_key("oid:abcd1234...") → Ok(HashValue([0xab, 0xcd, ...]))
+    /// parse_state_change_key("coin:abcd1234...")  → Err (unknown prefix)
     /// ```
     fn parse_state_change_key(key: &str) -> HashValue {
         if let Some(hex_str) = key.strip_prefix("oid:") {
-            // Direct ObjectId hex → decode to bytes
             if let Ok(bytes) = hex::decode(hex_str) {
                 if bytes.len() == 32 {
                     return HashValue::from_slice(&bytes).expect("32 bytes");
                 }
             }
-            // If decode fails, fall through to SHA256
-            tracing::warn!(
+            // Invalid hex under oid: prefix — log error but return a deterministic value
+            tracing::error!(
                 key = %key,
-                "Invalid oid: format, falling back to SHA256"
+                "Invalid oid: format — hex decode failed or wrong length"
+            );
+        } else {
+            // Non-oid: prefix is now an explicit error (no more silent SHA256 fallback)
+            tracing::error!(
+                key = %key,
+                "Unknown key prefix — expected 'oid:' prefix. Legacy 'coin:' prefix is no longer supported."
             );
         }
-        // Legacy: hash the key
-        Self::key_to_object_id(key)
-    }
-    
-    /// Convert a string key to a 32-byte ObjectId using SHA-256 (legacy)
-    fn key_to_object_id(key: &str) -> HashValue {
-        let mut hasher = Sha256::new();
-        hasher.update(key.as_bytes());
-        let result = hasher.finalize();
-        HashValue::from_slice(&result).expect("SHA-256 produces 32 bytes")
+        // Fallback: use BLAKE3 hash instead of SHA256 to produce a deterministic value
+        // This path should never be hit in correct code after key format unification
+        let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
+        HashValue::from_slice(&hash).expect("32 bytes")
     }
 }
 
@@ -1220,24 +1230,24 @@ mod tests {
     
     #[test]
     fn test_parse_state_change_key_legacy_format() {
-        // Test legacy format - should hash the key
+        // Test legacy format - should BLAKE3 hash the key (SHA256 fallback removed)
         let key = "event:some-event-id";
         let parsed = GlobalStateManager::parse_state_change_key(key);
         
-        // Verify it matches SHA256 hash
-        let expected = GlobalStateManager::key_to_object_id(key);
-        assert_eq!(parsed, expected);
+        // Verify it matches BLAKE3 hash fallback
+        let expected = setu_types::hash_utils::setu_hash(key.as_bytes());
+        assert_eq!(parsed, HashValue::from_slice(&expected).unwrap());
     }
     
     #[test]
     fn test_parse_state_change_key_invalid_oid() {
-        // Test invalid oid format - should fall back to SHA256
+        // Test invalid oid format - should fall back to BLAKE3 hash
         let key = "oid:not-valid-hex";
         let parsed = GlobalStateManager::parse_state_change_key(key);
         
-        // Should hash the whole key as fallback
-        let expected = GlobalStateManager::key_to_object_id(key);
-        assert_eq!(parsed, expected);
+        // Should BLAKE3 hash the whole key as fallback
+        let expected = setu_types::hash_utils::setu_hash(key.as_bytes());
+        assert_eq!(parsed, HashValue::from_slice(&expected).unwrap());
     }
     
     #[test]

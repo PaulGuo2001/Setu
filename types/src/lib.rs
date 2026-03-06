@@ -1,4 +1,5 @@
 // ========== Core Modules ==========
+pub mod hash_utils;     // Unified hash utilities (BLAKE3 + SHA256)
 pub mod event;
 pub mod transfer;       // Transfer and routing types
 pub mod registration;   // Registration types

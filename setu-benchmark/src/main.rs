@@ -55,12 +55,18 @@ async fn main() -> anyhow::Result<()> {
     // Print configuration
     config.print_config();
 
+    // Save output format before config is moved
+    let output_format = config.output.clone();
+
     // Run benchmark
     let runner = benchmark::BenchmarkRunner::new(config);
     let result = runner.run().await?;
 
-    // Print report
-    report::print_report(&result);
+    // Print report (supports text and json formats)
+    match output_format.as_str() {
+        "json" => println!("{}", report::json_report(&result)),
+        _ => report::print_report(&result),
+    }
 
     Ok(())
 }

@@ -929,11 +929,10 @@ impl ConsensusEngine {
     /// The real state root is now computed by AnchorBuilder using SMTs.
     #[deprecated(since = "0.2.0", note = "State root is now computed internally by ConsensusManager/AnchorBuilder")]
     fn compute_state_root_internal(&self, dag: &Dag) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(dag.node_count().to_le_bytes());
-        hasher.update(dag.max_depth().to_le_bytes());
-        hex::encode(hasher.finalize())
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&dag.node_count().to_le_bytes());
+        hasher.update(&dag.max_depth().to_le_bytes());
+        hex::encode(hasher.finalize().as_bytes())
     }
 
     /// Compute the state root (async version, legacy)
@@ -1392,15 +1391,8 @@ mod tests {
             
             // Verify it matches the expected computation
             let expected_root = {
-                use sha2::{Sha256, Digest};
                 let anchor_hash = anchor.compute_hash();
-                let mut hasher = Sha256::new();
-                hasher.update(&initial_root);
-                hasher.update(&anchor_hash);
-                let result = hasher.finalize();
-                let mut output = [0u8; 32];
-                output.copy_from_slice(&result);
-                output
+                setu_types::hash_utils::chain_hash(&initial_root, &anchor_hash)
             };
             
             assert_eq!(

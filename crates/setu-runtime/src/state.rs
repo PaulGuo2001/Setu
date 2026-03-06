@@ -119,7 +119,7 @@ mod tests {
     fn test_state_store_operations() {
         let mut store = InMemoryStateStore::new();
         
-        let owner = Address::from("alice");
+        let owner = Address::from_str_id("alice");
         let coin = setu_types::create_coin(owner.clone(), 1000);
         let coin_id = *coin.id();
         

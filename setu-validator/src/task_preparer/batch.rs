@@ -565,7 +565,7 @@ impl BatchTaskPreparer {
 
         // Build read_set
         let read_set = vec![ReadSetEntry::new(
-            format!("coin:{}", hex::encode(&coin.object_id)),
+            format!("oid:{}", hex::encode(&coin.object_id)),
             object_data,
         )
         .with_proof(

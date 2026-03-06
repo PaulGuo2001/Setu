@@ -29,7 +29,6 @@
 //! - AccountView stays lightweight and focused on owned objects
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
 
@@ -100,12 +99,10 @@ impl SubnetId {
     /// Create from a string identifier (hashes the string)
     /// Note: This creates an APP type subnet by default
     pub fn from_str_id(id: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"SUBNET:");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_SUBNET:");
         hasher.update(id.as_bytes());
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
+        let mut bytes = *hasher.finalize().as_bytes();
         // Mark as APP subnet
         bytes[0] = Self::APP_PREFIX;
         Self(bytes)
@@ -113,28 +110,28 @@ impl SubnetId {
     
     /// Create a new app subnet ID from creator address, name and nonce
     pub fn new_app(creator: &Address, name: &str, nonce: u64) -> Self {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(&[Self::APP_PREFIX]);
         hasher.update(creator.as_bytes());
         hasher.update(name.as_bytes());
-        hasher.update(nonce.to_le_bytes());
+        hasher.update(&nonce.to_le_bytes());
         let result = hasher.finalize();
         let mut bytes = [0u8; 32];
         bytes[0] = Self::APP_PREFIX;
-        bytes[1..].copy_from_slice(&result[..31]);
+        bytes[1..].copy_from_slice(&result.as_bytes()[..31]);
         Self(bytes)
     }
     
     /// Create a simple app subnet for testing (uses id as seed)
     #[cfg(any(test, feature = "test-utils"))]
     pub fn new_app_simple(id: u64) -> Self {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(&[Self::APP_PREFIX]);
-        hasher.update(id.to_le_bytes());
+        hasher.update(&id.to_le_bytes());
         let result = hasher.finalize();
         let mut bytes = [0u8; 32];
         bytes[0] = Self::APP_PREFIX;
-        bytes[1..].copy_from_slice(&result[..31]);
+        bytes[1..].copy_from_slice(&result.as_bytes()[..31]);
         Self(bytes)
     }
     
@@ -655,7 +652,7 @@ mod tests {
     
     #[test]
     fn test_user_membership() {
-        let user = Address::from("alice");
+        let user = Address::from_str_id("alice");
         let mut membership = UserSubnetMembership::new(user);
         
         let defi = SubnetId::from_str_id("defi");

@@ -79,7 +79,8 @@ impl InfraExecutor {
         let temp_store = InMemoryStateStore::new();
         let mut runtime = RuntimeExecutor::new(temp_store);
 
-        let owner = Address::from(registration.owner.as_str());
+        let owner = Address::from_hex(&registration.owner)
+            .map_err(|e| format!("Invalid owner address '{}': {}", registration.owner, e))?;
 
         let output = runtime.execute_subnet_register(
             &registration.subnet_id,
@@ -154,7 +155,8 @@ impl InfraExecutor {
         let temp_store = InMemoryStateStore::new();
         let mut runtime = RuntimeExecutor::new(temp_store);
 
-        let user_address = Address::from(registration.address.as_str());
+        let user_address = Address::from_hex(&registration.address)
+            .map_err(|e| format!("Invalid user address '{}': {}", registration.address, e))?;
         let subnet_id = registration.subnet_id.as_deref().unwrap_or("subnet-0");
 
         let output = runtime.execute_user_register(
@@ -250,7 +252,7 @@ mod tests {
         let provider = Arc::new(MerkleStateProvider::new(state_manager));
         let executor = InfraExecutor::new("validator-1".to_string(), provider);
 
-        let registration = SubnetRegistration::new("subnet-test", "Test Subnet", "owner-addr", "TEST")
+        let registration = SubnetRegistration::new("subnet-test", "Test Subnet", "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf", "TEST")
             .with_initial_supply(1_000_000);
 
         let vlc = VLCSnapshot {
@@ -274,7 +276,7 @@ mod tests {
         let executor = InfraExecutor::new("validator-1".to_string(), provider);
 
         let registration = UserRegistration::from_metamask(
-            "0x1234567890abcdef1234567890abcdef12345678",
+            "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
             1000,
         ).with_subnet("subnet-0");
 

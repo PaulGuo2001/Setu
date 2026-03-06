@@ -27,11 +27,12 @@ pub use key_identity::KeyIdentity;
 pub use keypair_file::{read_keypair_from_file, write_keypair_to_file, read_key};
 pub use keystore::{AccountKeystore, FileBasedKeystore, InMemKeystore, Keystore};
 pub use address_derive::{
-    EthereumAddress, 
-    derive_ethereum_address_from_secp256k1,
+    derive_address_from_secp256k1,
     derive_address_from_nostr_pubkey,
+    address_to_hex,
+    address_from_hex,
     verify_nostr_address_derivation,
-    verify_ethereum_address_derivation,
+    verify_secp256k1_address_derivation,
 };
 
 // Convenience alias

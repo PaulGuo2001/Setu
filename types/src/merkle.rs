@@ -14,7 +14,6 @@
 //! - Anchor chain uses append-only Binary Merkle Tree
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use crate::subnet::SubnetId;
@@ -102,16 +101,14 @@ impl ObjectStateValue {
     
     /// Compute the hash of this state value
     pub fn hash(&self) -> HashValue {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_STATE_VAL:");
         hasher.update(&self.owner);
-        hasher.update(self.version.to_le_bytes());
-        hasher.update([self.type_tag]);
+        hasher.update(&self.version.to_le_bytes());
+        hasher.update(&[self.type_tag]);
         hasher.update(&self.data_hash);
         hasher.update(self.subnet_id.as_bytes());
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
+        *hasher.finalize().as_bytes()
     }
     
     /// Check if this is a system object
@@ -238,7 +235,8 @@ impl AnchorMerkleRoots {
     
     /// Compute a digest of all Merkle roots for signing
     pub fn digest(&self) -> HashValue {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_MERKLE_ROOTS:");
         hasher.update(&self.events_root);
         hasher.update(&self.global_state_root);
         hasher.update(&self.anchor_chain_root);
@@ -251,10 +249,7 @@ impl AnchorMerkleRoots {
             hasher.update(self.subnet_roots.get(subnet_id).unwrap());
         }
         
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
+        *hasher.finalize().as_bytes()
     }
 }
 
@@ -397,18 +392,15 @@ impl CrossSubnetLock {
         objects: &[HashValue],
         expiry: u64,
     ) -> HashValue {
-        let mut hasher = Sha256::new();
-        hasher.update(b"CROSS_SUBNET_LOCK:");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_CROSS_LOCK:");
         hasher.update(source.as_bytes());
         hasher.update(target.as_bytes());
         for obj in objects {
             hasher.update(obj);
         }
-        hasher.update(expiry.to_le_bytes());
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
+        hasher.update(&expiry.to_le_bytes());
+        *hasher.finalize().as_bytes()
     }
     
     /// Check if the lock is expired

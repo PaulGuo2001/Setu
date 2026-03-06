@@ -268,7 +268,10 @@ async fn main() -> anyhow::Result<()> {
                 // Build state changes for each genesis account
                 let mut state_changes = Vec::new();
                 for account in &genesis_config.accounts {
-                    let owner_hex = Address::from(account.name.as_str()).to_string();
+                    // Validate that the address is a proper hex address
+                    let owner_addr = Address::from_hex(&account.address)
+                        .expect("genesis account must have valid hex address");
+                    let owner_hex = owner_addr.to_string();
                     let object_id_bytes = MerkleStateProvider::coin_object_id_with_type(
                         &owner_hex,
                         &genesis_config.subnet_id,
@@ -285,7 +288,7 @@ async fn main() -> anyhow::Result<()> {
                         new_value: Some(coin_state.to_bytes()),
                     });
                     info!(
-                        name = %account.name,
+                        name = ?account.name,
                         owner = %owner_hex,
                         balance = account.balance,
                         object_id = %hex::encode(object_id_bytes),

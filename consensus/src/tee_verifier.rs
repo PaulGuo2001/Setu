@@ -24,7 +24,6 @@
 //! ```
 
 use setu_types::event::{Event, ExecutionResult, StateChange};
-use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 
 /// TEE attestation attached to an execution result
@@ -73,28 +72,19 @@ impl TeeAttestation {
         }
     }
     
-    /// Compute commitment for a set of state changes (write-set)
+    /// Compute commitment for a set of state changes (write-set).
+    ///
+    /// Delegates to the canonical implementation in `hash_utils::compute_write_set_commitment`.
     pub fn compute_write_set_commitment(changes: &[StateChange]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        for change in changes {
-            hasher.update(change.key.as_bytes());
-            if let Some(ref old) = change.old_value {
-                hasher.update(&[1u8]);
-                hasher.update(old);
-            } else {
-                hasher.update(&[0u8]);
-            }
-            if let Some(ref new) = change.new_value {
-                hasher.update(&[1u8]);
-                hasher.update(new);
-            } else {
-                hasher.update(&[0u8]);
-            }
-        }
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result);
-        hash
+        let normalized: Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>)> = changes
+            .iter()
+            .map(|c| (
+                c.key.clone(),
+                c.old_value.clone(),
+                c.new_value.clone(),
+            ))
+            .collect();
+        setu_types::hash_utils::compute_write_set_commitment(&normalized)
     }
 }
 
