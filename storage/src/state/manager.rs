@@ -28,7 +28,6 @@ use setu_types::event::{Event, StateChange, ExecutionResult};
 use setu_types::coin::CoinState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use sha2::{Sha256, Digest};
 
 /// Manages Object State SMT for a single subnet
 #[derive(Clone)]
@@ -666,6 +665,12 @@ impl GlobalStateManager {
     // Coin Type Index Methods
     // =========================================================================
 
+    /// Resolve an owner string to a canonical hex address.
+    /// Delegates to `provider::resolve_owner_address` (single source of truth).
+    fn resolve_address(address: &str) -> String {
+        crate::state::provider::resolve_owner_address(address)
+    }
+
     /// Get all coin types (subnet IDs) for an address.
     /// 
     /// This is used by MerkleStateProvider to efficiently query coins
@@ -674,8 +679,9 @@ impl GlobalStateManager {
     /// # Returns
     /// Set of subnet IDs where the address has coins.
     pub fn get_coin_types_for_address(&self, address: &str) -> HashSet<String> {
+        let canonical = Self::resolve_address(address);
         self.coin_type_index
-            .get(address)
+            .get(&canonical)
             .cloned()
             .unwrap_or_default()
     }
@@ -685,8 +691,9 @@ impl GlobalStateManager {
     /// This is primarily used during initialization (e.g., genesis, tests).
     /// During normal operation, apply_state_change() handles index updates.
     pub fn register_coin_type(&mut self, address: &str, coin_type: &str) {
+        let canonical = Self::resolve_address(address);
         self.coin_type_index
-            .entry(address.to_string())
+            .entry(canonical)
             .or_default()
             .insert(coin_type.to_string());
     }
@@ -696,9 +703,10 @@ impl GlobalStateManager {
     /// This tracks both the coin type and the specific object_id,
     /// enabling efficient lookup of coins even after runtime split operations.
     pub fn register_coin_object(&mut self, address: &str, coin_type: &str, object_id: [u8; 32]) {
-        self.register_coin_type(address, coin_type);
+        let canonical = Self::resolve_address(address);
+        self.register_coin_type(&canonical, coin_type);
         self.owner_coin_index
-            .entry(address.to_string())
+            .entry(canonical)
             .or_default()
             .insert((object_id, coin_type.to_string()));
     }
@@ -707,8 +715,9 @@ impl GlobalStateManager {
     /// 
     /// Returns (object_id, coin_type) pairs for all coins owned by the address.
     pub fn get_coin_objects_for_address(&self, address: &str) -> Vec<([u8; 32], String)> {
+        let canonical = Self::resolve_address(address);
         self.owner_coin_index
-            .get(address)
+            .get(&canonical)
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default()
     }
@@ -800,39 +809,80 @@ impl GlobalStateManager {
         change: &StateChange,
     ) -> ApplyResult {
         let object_id = Self::parse_state_change_key(&change.key);
-        let smt = self.get_subnet_mut(subnet_id);
         
         match &change.new_value {
             Some(value) => {
-                // Insert or update
-                let root = smt.upsert(object_id, value.clone());
+                // Insert or update — SMT operation first, then index updates
+                let root = {
+                    let smt = self.get_subnet_mut(subnet_id);
+                    *smt.upsert(object_id, value.clone()).as_bytes()
+                };
+                // smt borrow released here
                 
                 // Update coin_type_index and owner_coin_index if this is a CoinState
-                // Parse the BCS-serialized CoinState to extract owner and coin_type
-                if let Some(coin_state) = CoinState::from_bytes(value) {
-                    self.coin_type_index
-                        .entry(coin_state.owner.clone())
-                        .or_default()
-                        .insert(coin_state.coin_type.clone());
+                if let Some(new_cs) = CoinState::from_bytes(value) {
+                    // If there's an old value, check if owner changed → clean up old index
+                    if let Some(ref old_bytes) = change.old_value {
+                        if let Some(old_cs) = CoinState::from_bytes(old_bytes) {
+                            if old_cs.owner != new_cs.owner {
+                                // Owner changed (e.g., full transfer) → remove from old owner's index
+                                if let Some(set) = self.owner_coin_index.get_mut(&old_cs.owner) {
+                                    set.remove(&(*object_id.as_bytes(), old_cs.coin_type.clone()));
+                                    if set.is_empty() {
+                                        self.owner_coin_index.remove(&old_cs.owner);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     
-                    // Track owner → object_id mapping
-                    self.owner_coin_index
-                        .entry(coin_state.owner.clone())
+                    // Add/update new owner's index entries
+                    self.coin_type_index
+                        .entry(new_cs.owner.clone())
                         .or_default()
-                        .insert((*object_id.as_bytes(), coin_state.coin_type.clone()));
+                        .insert(new_cs.coin_type.clone());
+                    
+                    self.owner_coin_index
+                        .entry(new_cs.owner.clone())
+                        .or_default()
+                        .insert((*object_id.as_bytes(), new_cs.coin_type.clone()));
                 }
                 
                 ApplyResult::Updated {
                     object_id: *object_id.as_bytes(),
-                    new_root: *root.as_bytes(),
+                    new_root: root,
                 }
             }
             None => {
-                // Delete
-                let removed = smt.delete(&object_id);
+                // Delete — clean up indices first, then remove from SMT.
+                // Prefer old_value from the StateChange; if absent, read from SMT
+                // before deletion so we can still clean up indices.
+                let effective_old = change.old_value.clone().or_else(|| {
+                    let smt = self.get_subnet_mut(subnet_id);
+                    smt.get(&object_id).cloned()
+                });
+                
+                if let Some(ref old_bytes) = effective_old {
+                    if let Some(old_cs) = CoinState::from_bytes(old_bytes) {
+                        // Remove from owner_coin_index
+                        if let Some(set) = self.owner_coin_index.get_mut(&old_cs.owner) {
+                            set.remove(&(*object_id.as_bytes(), old_cs.coin_type.clone()));
+                            if set.is_empty() {
+                                self.owner_coin_index.remove(&old_cs.owner);
+                            }
+                        }
+                        // Note: coin_type_index not cleaned here because the owner may
+                        // still have other coins of the same type. Cleaned during rebuild.
+                    }
+                }
+                
+                let existed = {
+                    let smt = self.get_subnet_mut(subnet_id);
+                    smt.delete(&object_id).is_some()
+                };
                 ApplyResult::Deleted {
                     object_id: *object_id.as_bytes(),
-                    existed: removed.is_some(),
+                    existed,
                 }
             }
         }
@@ -977,39 +1027,50 @@ impl GlobalStateManager {
     /// - `"oid:{hex}"`: Direct ObjectId hex from TEE output → decode directly
     /// - Other: Hash the key with SHA-256 (legacy fallback)
     /// 
+    /// Parse a state change key to a 32-byte HashValue.
+    ///
+    /// Only accepts the canonical `"oid:{hex}"` format. Any other format is an error.
+    /// This eliminates the legacy SHA256 fallback that silently produced wrong ObjectIds.
+    ///
     /// ## Example
     /// 
     /// ```ignore
-    /// // TEE output key (new format)
-    /// parse_state_change_key("oid:abcd1234...") → HashValue([0xab, 0xcd, ...])
-    /// 
-    /// // Legacy key (hashed)
-    /// parse_state_change_key("event:some-id") → SHA256("event:some-id")
+    /// parse_state_change_key("oid:abcd1234...") → Ok(HashValue([0xab, 0xcd, ...]))
+    /// parse_state_change_key("coin:abcd1234...")  → Err (unknown prefix)
     /// ```
     fn parse_state_change_key(key: &str) -> HashValue {
         if let Some(hex_str) = key.strip_prefix("oid:") {
-            // Direct ObjectId hex → decode to bytes
             if let Ok(bytes) = hex::decode(hex_str) {
                 if bytes.len() == 32 {
                     return HashValue::from_slice(&bytes).expect("32 bytes");
                 }
             }
-            // If decode fails, fall through to SHA256
-            tracing::warn!(
+            // Invalid hex under oid: prefix — log error but return a deterministic value
+            tracing::error!(
                 key = %key,
-                "Invalid oid: format, falling back to SHA256"
+                "Invalid oid: format — hex decode failed or wrong length"
+            );
+        } else if key.starts_with("user:") || key.starts_with("solver:") || key.starts_with("validator:") {
+            // Known non-object metadata key prefixes.
+            // These don't have a native 32-byte ObjectId, so we hash the key.
+            let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
+            return HashValue::from_slice(&hash).expect("32 bytes");
+        } else {
+            // Unknown prefix — this is a bug in the calling code
+            tracing::error!(
+                key = %key,
+                "Unknown key prefix — expected 'oid:', 'user:', 'solver:', or 'validator:' prefix."
             );
         }
-        // Legacy: hash the key
-        Self::key_to_object_id(key)
-    }
-    
-    /// Convert a string key to a 32-byte ObjectId using SHA-256 (legacy)
-    fn key_to_object_id(key: &str) -> HashValue {
-        let mut hasher = Sha256::new();
-        hasher.update(key.as_bytes());
-        let result = hasher.finalize();
-        HashValue::from_slice(&result).expect("SHA-256 produces 32 bytes")
+        // Fallback: use BLAKE3 hash to produce a deterministic value
+        // This path should never be hit in correct code after key format unification
+        debug_assert!(
+            false,
+            "parse_state_change_key: unexpected key format '{}'. All keys should use known prefixes.",
+            key
+        );
+        let hash = setu_types::hash_utils::setu_hash(key.as_bytes());
+        HashValue::from_slice(&hash).expect("32 bytes")
     }
 }
 
@@ -1219,25 +1280,19 @@ mod tests {
     }
     
     #[test]
+    #[should_panic(expected = "unexpected key format")]
     fn test_parse_state_change_key_legacy_format() {
-        // Test legacy format - should hash the key
+        // Legacy format without "oid:" prefix should panic (debug_assert)
         let key = "event:some-event-id";
-        let parsed = GlobalStateManager::parse_state_change_key(key);
-        
-        // Verify it matches SHA256 hash
-        let expected = GlobalStateManager::key_to_object_id(key);
-        assert_eq!(parsed, expected);
+        let _parsed = GlobalStateManager::parse_state_change_key(key);
     }
     
     #[test]
+    #[should_panic(expected = "unexpected key format")]
     fn test_parse_state_change_key_invalid_oid() {
-        // Test invalid oid format - should fall back to SHA256
+        // Invalid oid format should panic (debug_assert)
         let key = "oid:not-valid-hex";
-        let parsed = GlobalStateManager::parse_state_change_key(key);
-        
-        // Should hash the whole key as fallback
-        let expected = GlobalStateManager::key_to_object_id(key);
-        assert_eq!(parsed, expected);
+        let _parsed = GlobalStateManager::parse_state_change_key(key);
     }
     
     #[test]

@@ -68,14 +68,13 @@ impl SolverTask {
     /// Generate task_id from event and state context
     /// This creates a unique identifier for Attestation binding
     pub fn generate_task_id(event: &Event, pre_state_root: &[u8; 32]) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
-        
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_TASK_ID:");
         hasher.update(event.id.as_bytes());
         hasher.update(pre_state_root);
         hasher.update(&event.timestamp.to_le_bytes());
         
-        hasher.finalize().into()
+        *hasher.finalize().as_bytes()
     }
     
     /// Add read set entries

@@ -16,6 +16,9 @@ pub enum RuntimeError {
     #[error("Invalid ownership: object {object_id} is not owned by {address}")]
     InvalidOwnership { object_id: ObjectId, address: String },
     
+    #[error("Invalid address: {0}")]
+    InvalidAddress(String),
+    
     #[error("Invalid transaction: {0}")]
     InvalidTransaction(String),
     

@@ -3,8 +3,9 @@
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
 use setu_keys::{
-    SignatureScheme, SetuKeyPair, EthereumAddress,
-    derive_ethereum_address_from_secp256k1,
+    SignatureScheme, SetuKeyPair,
+    derive_address_from_secp256k1,
+    address_to_hex,
     generate_new_key,
     key_derive::derive_key_pair_from_mnemonic,
 };
@@ -20,7 +21,7 @@ pub struct KeypairData {
     pub node_id: String,
     /// Node type (validator or solver)
     pub node_type: String,
-    /// Ethereum-style account address (0x...)
+    /// Setu account address (0x + 64 hex chars, 32 bytes from Keccak256)
     pub account_address: String,
     /// Public key (hex encoded, 65 bytes uncompressed for secp256k1)
     pub public_key: String,
@@ -64,13 +65,14 @@ pub fn generate_keypair(
         _ => public_key.as_bytes(),
     };
     
-    // Derive Ethereum-style address
-    let eth_address = derive_ethereum_address_from_secp256k1(&public_key_bytes)
-        .context("Failed to derive Ethereum address")?;
+    // Derive Setu address (32 bytes from Keccak256)
+    let address_bytes = derive_address_from_secp256k1(&public_key_bytes)
+        .context("Failed to derive address")?;
+    let account_address = address_to_hex(&address_bytes);
     
     // Generate node_id if not provided
     let node_id = node_id.unwrap_or_else(|| {
-        format!("{}-{}", node_type, &eth_address.to_hex()[2..10])
+        format!("{}-{}", node_type, &account_address[2..10])
     });
     
     // Get private key bytes
@@ -85,7 +87,7 @@ pub fn generate_keypair(
     let keypair_data = KeypairData {
         node_id: node_id.clone(),
         node_type: node_type.to_string(),
-        account_address: eth_address.to_hex(),
+        account_address,
         public_key: hex::encode(&public_key_bytes),
         private_key: private_key_only,
         mnemonic: mnemonic.clone(),
@@ -145,13 +147,14 @@ pub fn recover_from_mnemonic(
         _ => public_key.as_bytes(),
     };
     
-    // Derive Ethereum-style address
-    let eth_address = derive_ethereum_address_from_secp256k1(&public_key_bytes)
-        .context("Failed to derive Ethereum address")?;
+    // Derive Setu address (32 bytes from Keccak256)
+    let address_bytes = derive_address_from_secp256k1(&public_key_bytes)
+        .context("Failed to derive address")?;
+    let account_address = address_to_hex(&address_bytes);
     
     // Generate node_id if not provided
     let node_id = node_id.unwrap_or_else(|| {
-        format!("{}-{}", node_type, &eth_address.to_hex()[2..10])
+        format!("{}-{}", node_type, &account_address[2..10])
     });
     
     // Get private key bytes
@@ -165,7 +168,7 @@ pub fn recover_from_mnemonic(
     let keypair_data = KeypairData {
         node_id: node_id.clone(),
         node_type: node_type.to_string(),
-        account_address: eth_address.to_hex(),
+        account_address,
         public_key: hex::encode(&public_key_bytes),
         private_key: private_key_only,
         mnemonic: mnemonic.to_string(),

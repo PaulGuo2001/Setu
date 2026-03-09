@@ -118,11 +118,9 @@ pub fn choose_index(weights: Vec<VotingPower>, seed: Vec<u8>) -> usize {
 
 /// Generate a deterministic pseudo-random value in [0, max) range from a seed.
 fn next_in_range(seed: Vec<u8>, max: VotingPower) -> VotingPower {
-    use sha2::{Digest, Sha256};
-    
-    let hash = Sha256::digest(&seed);
+    let hash = blake3::hash(&seed);
     let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hash[..16]);
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
     let value = u128::from_le_bytes(bytes);
     
     value % max

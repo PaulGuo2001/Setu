@@ -657,24 +657,13 @@ impl AnchorBuilder {
     
     /// Chain hash: combines previous chain root with new anchor hash
     /// 
-    /// new_root = SHA256(prev_root || anchor_hash)
-    /// 
-    /// This creates an append-only commitment where:
-    /// - R0 = [0; 32] (genesis)
-    /// - R1 = hash(R0 || H1)
-    /// - R2 = hash(R1 || H2)
-    /// - Rn = hash(R_{n-1} || Hn)
-    /// 
-    /// Each Rn commits to the entire history [H1, H2, ..., Hn]
+    /// Anchor chain append hash.
+    ///
+    /// new_root = BLAKE3("SETU_ANCHOR_CHAIN:" || prev_root || anchor_hash)
+    ///
+    /// Delegates to the canonical implementation in `hash_utils::chain_hash`.
     fn chain_hash(prev_root: &[u8; 32], anchor_hash: &[u8; 32]) -> [u8; 32] {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(prev_root);
-        hasher.update(anchor_hash);
-        let result = hasher.finalize();
-        let mut output = [0u8; 32];
-        output.copy_from_slice(&result);
-        output
+        setu_types::hash_utils::chain_hash(prev_root, anchor_hash)
     }
 }
 
@@ -707,6 +696,13 @@ mod tests {
         });
         event
     }
+
+    /// Generate a canonical "oid:{hex}" key for tests.
+    /// Hashes the seed with BLAKE3 to produce a deterministic 32-byte ObjectId.
+    fn test_oid_key(seed: &str) -> String {
+        let hash = setu_types::hash_utils::setu_hash(seed.as_bytes());
+        format!("oid:{}", hex::encode(hash))
+    }
     
     #[test]
     fn test_prepare_build_does_not_modify_state() {
@@ -725,7 +721,7 @@ mod tests {
             SubnetId::ROOT,
             vec![
                 StateChange {
-                    key: "balance:alice".to_string(),
+                    key: test_oid_key("balance:alice"),
                     old_value: Some(vec![0; 8]),
                     new_value: Some(vec![100; 8]),
                 },
@@ -764,7 +760,7 @@ mod tests {
         let event = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:alice".to_string(),
+                key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
             }],
@@ -803,7 +799,7 @@ mod tests {
         let event = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:alice".to_string(),
+                key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
             }],
@@ -834,7 +830,7 @@ mod tests {
         let event1 = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:alice".to_string(),
+                key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
             }],
@@ -842,7 +838,7 @@ mod tests {
         let event2 = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:bob".to_string(),
+                key: test_oid_key("balance:bob"),
                 old_value: None,
                 new_value: Some(vec![200; 8]),
             }],
@@ -879,7 +875,7 @@ mod tests {
             create_event_with_result(
                 SubnetId::ROOT,
                 vec![StateChange {
-                    key: "balance:alice".to_string(),
+                    key: test_oid_key("balance:alice"),
                     old_value: None,
                     new_value: Some(vec![100; 8]),
                 }],
@@ -887,7 +883,7 @@ mod tests {
             create_event_with_result(
                 app_subnet,
                 vec![StateChange {
-                    key: "nft:token1".to_string(),
+                    key: test_oid_key("nft:token1"),
                     old_value: None,
                     new_value: Some(vec![1; 32]),
                 }],
@@ -923,7 +919,7 @@ mod tests {
         let event1 = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:alice".to_string(),
+                key: test_oid_key("balance:alice"),
                 old_value: None,
                 new_value: Some(vec![100; 8]),
             }],
@@ -938,7 +934,7 @@ mod tests {
         let event2 = create_event_with_result(
             SubnetId::ROOT,
             vec![StateChange {
-                key: "balance:bob".to_string(),
+                key: test_oid_key("balance:bob"),
                 old_value: None,
                 new_value: Some(vec![200; 8]),
             }],

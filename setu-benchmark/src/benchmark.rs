@@ -2,7 +2,7 @@
 
 use crate::client::{generate_transfer, generate_transfer_with_n_accounts, BenchClient, BenchTransferRequest};
 use crate::config::{BenchmarkConfig, BenchmarkMode};
-use crate::metrics::{BenchmarkSummary, MetricsCollector};
+use crate::metrics::{BenchmarkSummary, MetricsCollector, RequestMetrics};
 use anyhow::{bail, Result};
 use futures::stream::{self, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,6 +44,50 @@ fn generate_single_transfer(config: &BenchmarkConfig, seq: u64) -> BenchTransfer
             seq,
         )
     }
+}
+
+/// Execute a transfer with retry logic for coin reservation conflicts.
+///
+/// In Setu's 1:1 coin model, concurrent transfers from the same sender
+/// will conflict on coin reservation. This retries with backoff and
+/// selects different senders on each retry attempt.
+async fn execute_transfer_with_retry(
+    client: &BenchClient,
+    config: &BenchmarkConfig,
+    seq: u64,
+) -> Option<RequestMetrics> {
+    let max_retries = 20u32;
+    let base_delay_ms = 3u64;
+    let total_accounts = config.init_accounts.max(3) as u64;
+
+    for attempt in 0..=max_retries {
+        let effective_seq = if attempt == 0 {
+            seq
+        } else {
+            seq.wrapping_add(attempt as u64 * 7)
+        };
+        let request = generate_single_transfer(config, effective_seq);
+        let result = client.submit_transfer(request).await;
+
+        if result.success {
+            return Some(result);
+        }
+
+        let is_reservation_error = result.error_message
+            .as_ref()
+            .map(|msg| msg.contains("reserved") || msg.contains("Reserved"))
+            .unwrap_or(false);
+
+        if !is_reservation_error || attempt == max_retries {
+            return Some(result);
+        }
+
+        let delay = (base_delay_ms * (attempt as u64 + 1)).min(30);
+        let jitter = (seq % total_accounts) % 5;
+        tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
+    }
+
+    None
 }
 
 /// Benchmark runner
@@ -131,6 +175,8 @@ impl BenchmarkRunner {
         let warmup_count = self.config.warmup;
         let concurrency = (self.config.concurrency as usize).min(warmup_count as usize);
         let semaphore = Arc::new(Semaphore::new(concurrency));
+        // Use a large seq offset so warmup doesn't overlap with benchmark seq range (0..total)
+        let warmup_seq_offset = 1_000_000u64;
 
         let tasks: Vec<_> = (0..warmup_count)
             .map(|i| {
@@ -139,39 +185,7 @@ impl BenchmarkRunner {
                 let config = self.config.clone();
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    
-                    // Retry logic for coin reservation conflicts during warmup
-                    let max_retries = 20u32;
-                    let base_delay_ms = 3u64;
-                    let total_accounts = config.init_accounts.max(3) as u64;
-                    
-                    for attempt in 0..=max_retries {
-                        // On retry, offset the seq to try a different sender
-                        let effective_seq = if attempt == 0 {
-                            i
-                        } else {
-                            i.wrapping_add(attempt as u64 * 7)
-                        };
-                        let request = generate_single_transfer(&config, effective_seq);
-                        let result = client.submit_transfer(request).await;
-                        
-                        if result.success {
-                            break;
-                        }
-                        
-                        let is_reservation_error = result.error_message
-                            .as_ref()
-                            .map(|msg| msg.contains("reserved") || msg.contains("Reserved"))
-                            .unwrap_or(false);
-                        
-                        if !is_reservation_error || attempt == max_retries {
-                            break;
-                        }
-                        
-                        let delay = (base_delay_ms * (attempt as u64 + 1)).min(30);
-                        let jitter = (i % total_accounts) as u64 % 5;
-                        tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
-                    }
+                    let _ = execute_transfer_with_retry(&client, &config, warmup_seq_offset + i).await;
                 }
             })
             .collect();
@@ -444,50 +458,7 @@ impl BenchmarkRunner {
                 let counter = counter.clone();
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    
-                    // Retry logic for coin reservation conflicts
-                    // With 50 concurrency and 100 accounts, expect ~50% collision rate
-                    // TEE execution takes ~5-30ms, so we need retries spanning that window
-                    // On retry, we use a different seq to select a different sender
-                    let max_retries = 20u32;
-                    let base_delay_ms = 3u64;
-                    let mut last_result = None;
-                    let total_accounts = config.init_accounts.max(3) as u64;
-                    
-                    for attempt in 0..=max_retries {
-                        // On retry, offset the seq to try a different sender
-                        let effective_seq = if attempt == 0 {
-                            i
-                        } else {
-                            i.wrapping_add(attempt as u64 * 7) // prime multiplier for spread
-                        };
-                        let request = generate_single_transfer(&config, effective_seq);
-                        let result = client.submit_transfer(request).await;
-                        
-                        if result.success {
-                            last_result = Some(result);
-                            break;
-                        }
-                        
-                        // Check if it's a coin reservation error (retryable)
-                        let is_reservation_error = result.error_message
-                            .as_ref()
-                            .map(|msg| msg.contains("reserved") || msg.contains("Reserved"))
-                            .unwrap_or(false);
-                        
-                        if !is_reservation_error || attempt == max_retries {
-                            // Non-retryable error or exhausted retries
-                            last_result = Some(result);
-                            break;
-                        }
-                        
-                        // Short delay with jitter (3ms, 6ms, 9ms, ... capped at 30ms)
-                        let delay = (base_delay_ms * (attempt as u64 + 1)).min(30);
-                        let jitter = (i % total_accounts) as u64 % 5; // spread jitter
-                        tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
-                    }
-                    
-                    if let Some(result) = last_result {
+                    if let Some(result) = execute_transfer_with_retry(&client, &config, i).await {
                         metrics.record(result).await;
                     }
                     counter.fetch_add(1, Ordering::Relaxed);
@@ -574,43 +545,7 @@ impl BenchmarkRunner {
 
             tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                
-                // Retry logic for coin reservation conflicts (same as burst mode)
-                let max_retries = 20u32;
-                let base_delay_ms = 3u64;
-                let total_accounts = config.init_accounts.max(3) as u64;
-                let mut last_result = None;
-                
-                for attempt in 0..=max_retries {
-                    let effective_seq = if attempt == 0 {
-                        current_seq
-                    } else {
-                        current_seq.wrapping_add(attempt as u64 * 7)
-                    };
-                    let request = generate_single_transfer(&config, effective_seq);
-                    let result = client.submit_transfer(request).await;
-                    
-                    if result.success {
-                        last_result = Some(result);
-                        break;
-                    }
-                    
-                    let is_reservation_error = result.error_message
-                        .as_ref()
-                        .map(|msg| msg.contains("reserved") || msg.contains("Reserved"))
-                        .unwrap_or(false);
-                    
-                    if !is_reservation_error || attempt == max_retries {
-                        last_result = Some(result);
-                        break;
-                    }
-                    
-                    let delay = (base_delay_ms * (attempt as u64 + 1)).min(30);
-                    let jitter = (current_seq % total_accounts) as u64 % 5;
-                    tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
-                }
-                
-                if let Some(result) = last_result {
+                if let Some(result) = execute_transfer_with_retry(&client, &config, current_seq).await {
                     metrics_clone.record(result).await;
                 }
                 counter_clone.fetch_add(1, Ordering::Relaxed);
@@ -664,43 +599,7 @@ impl BenchmarkRunner {
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    
-                    // Retry logic for coin reservation conflicts
-                    let max_retries = 20u32;
-                    let base_delay_ms = 3u64;
-                    let total_accounts = config.init_accounts.max(3) as u64;
-                    let mut last_result = None;
-                    
-                    for attempt in 0..=max_retries {
-                        let effective_seq = if attempt == 0 {
-                            s
-                        } else {
-                            s.wrapping_add(attempt as u64 * 7)
-                        };
-                        let request = generate_single_transfer(&config, effective_seq);
-                        let result = client.submit_transfer(request).await;
-                        
-                        if result.success {
-                            last_result = Some(result);
-                            break;
-                        }
-                        
-                        let is_reservation_error = result.error_message
-                            .as_ref()
-                            .map(|msg| msg.contains("reserved") || msg.contains("Reserved"))
-                            .unwrap_or(false);
-                        
-                        if !is_reservation_error || attempt == max_retries {
-                            last_result = Some(result);
-                            break;
-                        }
-                        
-                        let delay = (base_delay_ms * (attempt as u64 + 1)).min(30);
-                        let jitter = (s % total_accounts) as u64 % 5;
-                        tokio::time::sleep(Duration::from_millis(delay + jitter)).await;
-                    }
-                    
-                    if let Some(result) = last_result {
+                    if let Some(result) = execute_transfer_with_retry(&client, &config, s).await {
                         metrics_clone.record(result).await;
                     }
                     counter_clone.fetch_add(1, Ordering::Relaxed);

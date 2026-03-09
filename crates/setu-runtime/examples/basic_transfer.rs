@@ -15,9 +15,9 @@ async fn main() -> anyhow::Result<()> {
     // 1. 创建状态存储
     let mut store = InMemoryStateStore::new();
     
-    // 2. 初始化账户和 Coin
-    let alice = Address::from("alice");
-    let bob = Address::from("bob");
+    // 2. 初始化账户和 Coin (devnet genesis addresses)
+    let alice = Address::from_hex("0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf").unwrap();
+    let bob = Address::from_hex("0xeedf1a9c68b3f4a8b1a1032b2b5ad5c4795c026514f8317c7a215e218dccd6cf").unwrap();
     
     println!("👤 Alice: {}", alice);
     println!("👤 Bob: {}", bob);

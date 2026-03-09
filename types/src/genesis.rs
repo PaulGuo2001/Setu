@@ -26,8 +26,12 @@ pub struct GenesisConfig {
 /// A single account entry in genesis.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisAccount {
-    /// Human-readable name (will be hashed to Address)
-    pub name: String,
+    /// Hex address ("0x" + 64 hex chars) derived from a real public key
+    pub address: String,
+
+    /// Optional human-readable label (not used for address derivation)
+    #[serde(default)]
+    pub name: Option<String>,
 
     /// Initial balance in the smallest unit
     pub balance: u64,

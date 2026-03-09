@@ -11,7 +11,8 @@
 use serde::{Deserialize, Serialize};
 use tracing::{info, debug, warn};
 use setu_types::{
-    ObjectId, Address, CoinType, create_typed_coin, deterministic_coin_id,
+    ObjectId, Address, CoinType, Balance, CoinData, Object,
+    deterministic_coin_id,
 };
 // Note: Coin::to_coin_state_bytes() is used via trait method on Object<CoinData>
 use crate::error::{RuntimeError, RuntimeResult};
@@ -67,6 +68,21 @@ pub enum StateChangeType {
     Update,
     /// Object deletion
     Delete,
+}
+
+impl StateChange {
+    /// Convert runtime StateChange to event-layer StateChange for storage/network.
+    ///
+    /// Uses canonical "oid:{hex}" key format.
+    /// NOTE: `change_type` is intentionally NOT carried over — storage layer
+    /// derives operation type from new_state: Some(_) → Create/Update, None → Delete.
+    pub fn to_event_state_change(&self) -> setu_types::StateChange {
+        setu_types::StateChange {
+            key: setu_types::object_key(&self.object_id),
+            old_value: self.old_state.clone(),
+            new_value: self.new_state.clone(),
+        }
+    }
 }
 
 /// Runtime executor
@@ -140,6 +156,15 @@ impl<S: StateStore> RuntimeExecutor<S> {
         let mut coin = self.state.get_object(&coin_id)?
             .ok_or(RuntimeError::ObjectNotFound(coin_id))?;
         
+        // 1.5. 确保 Coin 是 Owned 对象（防御性检查）
+        // transfer_to() 对非 Owned 对象会静默跳过，导致生成无效 StateChange。
+        // 所有 Coin 都应该是 OwnedObject，如果不是则说明数据已损坏。
+        if !coin.is_owned() {
+            return Err(RuntimeError::InvalidTransaction(
+                format!("Coin {} is not an owned object — cannot transfer", coin_id)
+            ));
+        }
+        
         // 2. 验证所有权
         let owner = coin.metadata.owner.as_ref()
             .ok_or(RuntimeError::InvalidOwnership {
@@ -173,9 +198,8 @@ impl<S: StateStore> RuntimeExecutor<S> {
                     "Full transfer"
                 );
                 
-                // 更改所有者
-                coin.metadata.owner = Some(recipient.clone());
-                coin.metadata.version += 1;
+                // transfer_to updates owner, ownership, version, and digest
+                coin.transfer_to(recipient.clone());
                 
                 // Use BCS serialization for storage compatibility
                 let new_state = coin.to_coin_state_bytes();
@@ -191,25 +215,29 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 });
             }
             
-            // 部分转账：需要分割 Coin
-            Some(amount) => {
+            // 部分转账：使用 get-or-deposit 模式，确定性 coin ID
+            Some(amount) if amount < coin.data.balance.value() => {
+                let coin_type_str = coin.data.coin_type.as_str().to_string();
+                
                 debug!(
                     coin_id = %coin_id,
                     from = %tx.sender,
                     to = %recipient,
                     amount = amount,
                     remaining = coin.data.balance.value() - amount,
-                    "Partial transfer (split)"
+                    "Partial transfer (get-or-deposit)"
                 );
                 
                 // 从原 Coin 中提取金额
                 let transferred_balance = coin.data.balance.withdraw(amount)
                     .map_err(|e| RuntimeError::InvalidTransaction(e))?;
                 
-                // 更新原 Coin (BCS format)
-                coin.metadata.version += 1;
+                // 更新原 Coin: increment_version 同时更新 version 和 digest
+                // (之前用 `version += 1` 未更新 digest——虽然 CoinState 不含 digest,
+                //  但保持内存 Object 状态一致性，避免后续维护隐患)
+                coin.increment_version();
                 let new_state = coin.to_coin_state_bytes();
-                self.state.set_object(coin_id, coin.clone())?;
+                self.state.set_object(coin_id, coin)?;  // move, 不再 clone
                 
                 state_changes.push(StateChange {
                     change_type: StateChangeType::Update,
@@ -218,25 +246,77 @@ impl<S: StateStore> RuntimeExecutor<S> {
                     new_state: Some(new_state),
                 });
                 
-                // 创建新 Coin 给接收者
-                let new_coin = create_typed_coin(
-                    recipient.clone(),
-                    transferred_balance.value(),
-                    coin.data.coin_type.as_str(),
+                // Use deterministic coin ID for recipient (1:1 model: one coin per address per subnet)
+                let recipient_coin_id = deterministic_coin_id(recipient, &coin_type_str);
+                
+                if let Some(mut existing_coin) = self.state.get_object(&recipient_coin_id)? {
+                    // Recipient already has a coin of this type → deposit into existing
+                    let old_recipient_state = existing_coin.to_coin_state_bytes();
+                    existing_coin.data.balance.deposit(transferred_balance)
+                        .map_err(|e| RuntimeError::InvalidTransaction(e))?;
+                    existing_coin.increment_version();
+                    let new_recipient_state = existing_coin.to_coin_state_bytes();
+                    
+                    self.state.set_object(recipient_coin_id, existing_coin)?;
+                    
+                    state_changes.push(StateChange {
+                        change_type: StateChangeType::Update,
+                        object_id: recipient_coin_id,
+                        old_state: Some(old_recipient_state),
+                        new_state: Some(new_recipient_state),
+                    });
+                } else {
+                    // Recipient doesn't have this coin type → create new coin with deterministic ID
+                    let data = CoinData {
+                        coin_type: CoinType::new(&coin_type_str),
+                        balance: Balance::new(amount),
+                    };
+                    let new_coin = Object::new_owned(recipient_coin_id, recipient.clone(), data);
+                    let new_coin_state = new_coin.to_coin_state_bytes();
+                    
+                    self.state.set_object(recipient_coin_id, new_coin)?;
+                    
+                    created_objects.push(recipient_coin_id);
+                    state_changes.push(StateChange {
+                        change_type: StateChangeType::Create,
+                        object_id: recipient_coin_id,
+                        old_state: None,
+                        new_state: Some(new_coin_state),
+                    });
+                }
+            }
+            
+            // amount == full balance → treat as full transfer (avoid zombie 0-balance coin)
+            Some(amount) if amount == coin.data.balance.value() => {
+                debug!(
+                    coin_id = %coin_id,
+                    from = %tx.sender,
+                    to = %recipient,
+                    amount = amount,
+                    "Full transfer (amount == balance, ownership transfer)"
                 );
-                let new_coin_id = *new_coin.id();
-                // Use BCS serialization for new coin
-                let new_coin_state = new_coin.to_coin_state_bytes();
                 
-                self.state.set_object(new_coin_id, new_coin)?;
+                coin.transfer_to(recipient.clone());
+                let new_state = coin.to_coin_state_bytes();
+                self.state.set_object(coin_id, coin)?;
                 
-                created_objects.push(new_coin_id);
                 state_changes.push(StateChange {
-                    change_type: StateChangeType::Create,
-                    object_id: new_coin_id,
-                    old_state: None,
-                    new_state: Some(new_coin_state),
+                    change_type: StateChangeType::Update,
+                    object_id: coin_id,
+                    old_state: Some(old_state),
+                    new_state: Some(new_state),
                 });
+            }
+            
+            // amount > balance → insufficient funds
+            Some(amount) => {
+                return Err(RuntimeError::InvalidTransaction(
+                    format!(
+                        "Insufficient balance: requested {}, available {}",
+                        amount,
+                        coin.data.balance.value()
+                    )
+                ));
             }
         }
         
@@ -340,8 +420,10 @@ impl<S: StateStore> RuntimeExecutor<S> {
         amount: Option<u64>,
         ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
-        let sender_addr = Address::from(sender);
-        let recipient_addr = Address::from(recipient);
+        let sender_addr = Address::from_hex(sender)
+            .map_err(|_| RuntimeError::InvalidAddress(sender.to_string()))?;
+        let recipient_addr = Address::from_hex(recipient)
+            .map_err(|_| RuntimeError::InvalidAddress(recipient.to_string()))?;
         
         info!(
             coin_id = %coin_id,
@@ -352,11 +434,15 @@ impl<S: StateStore> RuntimeExecutor<S> {
         );
         
         // Create and execute the transfer transaction
-        let tx = Transaction::new_transfer(
+        // ⚠️ Use deterministic constructor — this is a TEE/consensus path.
+        // Transaction::new_transfer uses SystemTime::now() which would produce
+        // different values across validators, breaking consensus.
+        let tx = Transaction::new_transfer_deterministic(
             sender_addr,
             coin_id,
             recipient_addr,
             amount,
+            ctx.timestamp,
         );
         
         self.execute_transaction(&tx, ctx)
@@ -394,8 +480,20 @@ impl<S: StateStore> RuntimeExecutor<S> {
         amount: u64,
         ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
-        let sender = Address::from(from);
-        let recipient = Address::from(to);
+        // ⚠️ Safety: execute_simple_transfer auto-selects coins, which is
+        // non-deterministic across validators. TEE/consensus paths MUST use
+        // execute_transfer_with_coin (coin pre-selected by TaskPreparer).
+        if ctx.in_tee {
+            return Err(RuntimeError::InvalidTransaction(
+                "execute_simple_transfer must not be called in TEE path — \
+                 use execute_transfer_with_coin with pre-selected coin_id".to_string()
+            ));
+        }
+        
+        let sender = Address::from_hex(from)
+            .map_err(|_| RuntimeError::InvalidAddress(from.to_string()))?;
+        let recipient = Address::from_hex(to)
+            .map_err(|_| RuntimeError::InvalidAddress(to.to_string()))?;
         
         info!(
             from = %from,
@@ -453,11 +551,13 @@ impl<S: StateStore> RuntimeExecutor<S> {
         })?;
         
         // 4. Create and execute the transfer transaction
-        let tx = Transaction::new_transfer(
+        // ⚠️ Use deterministic constructor — this is a TEE/consensus path.
+        let tx = Transaction::new_transfer_deterministic(
             sender,
             coin_id,
             recipient,
             Some(amount), // Always partial transfer for simple API
+            ctx.timestamp,
         );
         
         self.execute_transaction(&tx, ctx)
@@ -478,7 +578,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
         owner: &Address,
         token_symbol: Option<&str>,
         initial_supply: Option<u64>,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
         let mut state_changes = Vec::new();
         let mut created_objects = Vec::new();
@@ -490,18 +590,13 @@ impl<S: StateStore> RuntimeExecutor<S> {
             "name": name,
             "owner": owner.to_string(),
             "token_symbol": token_symbol,
-            "created_at": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            "created_at": ctx.timestamp,
         });
         
-        // Generate deterministic ObjectId from subnet key
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(subnet_key.as_bytes());
-        let hash: [u8; 32] = hasher.finalize().into();
-        let subnet_object_id = ObjectId::new(hash);
+        // Generate deterministic ObjectId from subnet key (domain-separated)
+        let subnet_object_id = ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(b"SETU_SUBNET_META:", subnet_key.as_bytes())
+        );
         
         // Note: SubnetMetadata is NOT a Coin, so we keep JSON format for it
         // Only Coin objects use BCS format
@@ -520,12 +615,13 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 // token_symbol is only for display purposes (stored in SubnetConfig)
                 let coin_id = deterministic_coin_id(owner, subnet_id);
                 
-                // Create token coin for subnet owner
-                let token_coin = create_typed_coin(
-                    owner.clone(),
-                    supply,
-                    subnet_id,  // Use subnet_id as coin_type internally
-                );
+                // Create token coin for subnet owner with deterministic ID
+                // (not via create_typed_coin, whose internal ID would differ from coin_id)
+                let data = CoinData {
+                    coin_type: CoinType::new(subnet_id),
+                    balance: Balance::new(supply),
+                };
+                let token_coin = Object::new_owned(coin_id, owner.clone(), data);
                 // Use BCS serialization for Coin storage
                 let coin_state = token_coin.to_coin_state_bytes();
                 
@@ -581,7 +677,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
         &mut self,
         user_address: &Address,
         subnet_id: &str,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> RuntimeResult<ExecutionOutput> {
         let mut state_changes = Vec::new();
         
@@ -590,18 +686,13 @@ impl<S: StateStore> RuntimeExecutor<S> {
         let membership_data = serde_json::json!({
             "user": user_address.to_string(),
             "subnet_id": subnet_id,
-            "joined_at": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            "joined_at": ctx.timestamp,
         });
         
-        // Generate deterministic ObjectId from membership key
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(membership_key.as_bytes());
-        let hash: [u8; 32] = hasher.finalize().into();
-        let membership_object_id = ObjectId::new(hash);
+        // Generate deterministic ObjectId from membership key (domain-separated)
+        let membership_object_id = ObjectId::new(
+            setu_types::hash_utils::setu_hash_with_domain(b"SETU_MEMBERSHIP:", membership_key.as_bytes())
+        );
         
         state_changes.push(StateChange {
             change_type: StateChangeType::Create,
@@ -681,11 +772,14 @@ impl<S: StateStore> RuntimeExecutor<S> {
                 new_state: Some(new_state),
             }, false)
         } else {
-            // Create new coin - use BCS format
-            let coin = create_typed_coin(to.clone(), amount, subnet_id);
+            // Create new coin with deterministic ID - use BCS format
+            let data = CoinData {
+                coin_type: CoinType::new(subnet_id),
+                balance: Balance::new(amount),
+            };
+            let coin = Object::new_owned(coin_id, to.clone(), data);
             let new_state = coin.to_coin_state_bytes();
             
-            // Store with deterministic ID (not the random ID from create_typed_coin)
             self.state.set_object(coin_id, coin)?;
             
             (StateChange {
@@ -733,13 +827,16 @@ impl<S: StateStore> RuntimeExecutor<S> {
         let coin_id = deterministic_coin_id(owner, subnet_id);
         
         // Check if coin already exists
-        if self.state.get_object(&coin_id).is_ok() {
+        if self.state.get_object(&coin_id)?.is_some() {
             return Ok((coin_id, false));
         }
         
         // Create new coin with 0 balance using deterministic ID
-        let coin = create_typed_coin(owner.clone(), 0, subnet_id);
-        // Note: create_typed_coin generates random ID, but we use deterministic ID for storage
+        let data = CoinData {
+            coin_type: CoinType::new(subnet_id),
+            balance: Balance::new(0),
+        };
+        let coin = Object::new_owned(coin_id, owner.clone(), data);
         self.state.set_object(coin_id, coin)?;
         
         info!(
@@ -763,8 +860,8 @@ mod tests {
     #[test]
     fn test_full_transfer() {
         let mut store = InMemoryStateStore::new();
-        let sender = Address::from("alice");
-        let recipient = Address::from("bob");
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
         
         // 创建初始 Coin
         let coin = setu_types::create_coin(sender.clone(), 1000);
@@ -797,8 +894,8 @@ mod tests {
     #[test]
     fn test_partial_transfer() {
         let mut store = InMemoryStateStore::new();
-        let sender = Address::from("alice");
-        let recipient = Address::from("bob");
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
         
         let coin = setu_types::create_coin(sender.clone(), 1000);
         let coin_id = *coin.id();
@@ -823,16 +920,191 @@ mod tests {
         let output = executor.execute_transaction(&tx, &ctx).unwrap();
         
         assert!(output.success);
+        // get-or-deposit: new coin created for recipient
         assert_eq!(output.created_objects.len(), 1);
         
         // 验证原 Coin 余额减少
         let original_coin = executor.state().get_object(&coin_id).unwrap().unwrap();
         assert_eq!(original_coin.data.balance.value(), 700);
         
-        // 验证新 Coin 创建
-        let new_coin_id = output.created_objects[0];
-        let new_coin = executor.state().get_object(&new_coin_id).unwrap().unwrap();
+        // 验证 recipient coin 使用确定性 ID
+        let expected_coin_id = deterministic_coin_id(&recipient, "ROOT");
+        assert_eq!(output.created_objects[0], expected_coin_id);
+        let new_coin = executor.state().get_object(&expected_coin_id).unwrap().unwrap();
         assert_eq!(new_coin.data.balance.value(), 300);
         assert_eq!(new_coin.metadata.owner.unwrap(), recipient);
+    }
+    
+    #[test]
+    fn test_partial_transfer_deposit_into_existing() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
+        
+        // Alice has 1000
+        let alice_coin = setu_types::create_coin(sender.clone(), 1000);
+        let alice_coin_id = *alice_coin.id();
+        store.set_object(alice_coin_id, alice_coin).unwrap();
+        
+        // Bob already has 500 (with deterministic ID)
+        let bob_coin_id = deterministic_coin_id(&recipient, "ROOT");
+        let bob_data = CoinData {
+            coin_type: CoinType::native(),
+            balance: Balance::new(500),
+        };
+        let bob_coin = Object::new_owned(bob_coin_id, recipient.clone(), bob_data);
+        store.set_object(bob_coin_id, bob_coin).unwrap();
+        
+        let mut executor = RuntimeExecutor::new(store);
+        
+        // Transfer 300 from Alice to Bob
+        let tx = Transaction::new_transfer(
+            sender.clone(),
+            alice_coin_id,
+            recipient.clone(),
+            Some(300),
+        );
+        
+        let ctx = ExecutionContext {
+            executor_id: "solver1".to_string(),
+            timestamp: 1000,
+            in_tee: false,
+        };
+        
+        let output = executor.execute_transaction(&tx, &ctx).unwrap();
+        
+        assert!(output.success);
+        // No new coin created — deposited into existing
+        assert_eq!(output.created_objects.len(), 0);
+        // 2 state changes: sender Update + recipient Update
+        assert_eq!(output.state_changes.len(), 2);
+        assert_eq!(output.state_changes[1].change_type, StateChangeType::Update);
+        
+        // Verify balances
+        let alice_coin = executor.state().get_object(&alice_coin_id).unwrap().unwrap();
+        assert_eq!(alice_coin.data.balance.value(), 700);
+        
+        let bob_coin = executor.state().get_object(&bob_coin_id).unwrap().unwrap();
+        assert_eq!(bob_coin.data.balance.value(), 800); // 500 + 300
+    }
+    
+    /// Balance conservation: sum of all balances must be unchanged after any transfer.
+    #[test]
+    fn test_balance_conservation_full_transfer() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
+        
+        let coin = setu_types::create_coin(sender.clone(), 1000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+        
+        let before_total: u64 = 1000; // only alice has balance
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), None);
+        let ctx = ExecutionContext { executor_id: "s".into(), timestamp: 1, in_tee: false };
+        executor.execute_transaction(&tx, &ctx).unwrap();
+        
+        // After full transfer: sender coin now owned by recipient, balance unchanged
+        let coin = executor.state().get_object(&coin_id).unwrap().unwrap();
+        let after_total = coin.data.balance.value();
+        assert_eq!(before_total, after_total, "Balance conservation violated in full transfer");
+    }
+    
+    #[test]
+    fn test_balance_conservation_partial_transfer() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
+        
+        let coin = setu_types::create_coin(sender.clone(), 1000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+        
+        let before_total: u64 = 1000;
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), Some(300));
+        let ctx = ExecutionContext { executor_id: "s".into(), timestamp: 1, in_tee: false };
+        executor.execute_transaction(&tx, &ctx).unwrap();
+        
+        // Sum: sender remaining + recipient new coin
+        let sender_coin = executor.state().get_object(&coin_id).unwrap().unwrap();
+        let recipient_coin_id = deterministic_coin_id(&recipient, "ROOT");
+        let recipient_coin = executor.state().get_object(&recipient_coin_id).unwrap().unwrap();
+        let after_total = sender_coin.data.balance.value() + recipient_coin.data.balance.value();
+        assert_eq!(before_total, after_total, "Balance conservation violated in partial transfer");
+    }
+    
+    #[test]
+    fn test_balance_conservation_deposit_into_existing() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
+        
+        let alice_coin = setu_types::create_coin(sender.clone(), 1000);
+        let alice_coin_id = *alice_coin.id();
+        store.set_object(alice_coin_id, alice_coin).unwrap();
+        
+        let bob_coin_id = deterministic_coin_id(&recipient, "ROOT");
+        let bob_data = CoinData { coin_type: CoinType::native(), balance: Balance::new(500) };
+        let bob_coin = Object::new_owned(bob_coin_id, recipient.clone(), bob_data);
+        store.set_object(bob_coin_id, bob_coin).unwrap();
+        
+        let before_total: u64 = 1000 + 500;
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let tx = Transaction::new_transfer(sender.clone(), alice_coin_id, recipient.clone(), Some(300));
+        let ctx = ExecutionContext { executor_id: "s".into(), timestamp: 1, in_tee: false };
+        executor.execute_transaction(&tx, &ctx).unwrap();
+        
+        let alice = executor.state().get_object(&alice_coin_id).unwrap().unwrap();
+        let bob = executor.state().get_object(&bob_coin_id).unwrap().unwrap();
+        let after_total = alice.data.balance.value() + bob.data.balance.value();
+        assert_eq!(before_total, after_total, "Balance conservation violated in deposit-into-existing");
+    }
+    
+    #[test]
+    fn test_balance_conservation_amount_equals_balance() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
+        
+        let coin = setu_types::create_coin(sender.clone(), 1000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+        
+        let before_total: u64 = 1000;
+        
+        let mut executor = RuntimeExecutor::new(store);
+        // amount == balance → treated as full transfer
+        let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), Some(1000));
+        let ctx = ExecutionContext { executor_id: "s".into(), timestamp: 1, in_tee: false };
+        executor.execute_transaction(&tx, &ctx).unwrap();
+        
+        let coin = executor.state().get_object(&coin_id).unwrap().unwrap();
+        let after_total = coin.data.balance.value();
+        assert_eq!(before_total, after_total, "Balance conservation violated in amount==balance transfer");
+        // Verify ownership transferred
+        assert_eq!(coin.metadata.owner.unwrap(), recipient);
+    }
+    
+    #[test]
+    fn test_insufficient_balance_rejected() {
+        let mut store = InMemoryStateStore::new();
+        let sender = Address::from_str_id("alice");
+        let recipient = Address::from_str_id("bob");
+        
+        let coin = setu_types::create_coin(sender.clone(), 1000);
+        let coin_id = *coin.id();
+        store.set_object(coin_id, coin).unwrap();
+        
+        let mut executor = RuntimeExecutor::new(store);
+        let tx = Transaction::new_transfer(sender.clone(), coin_id, recipient.clone(), Some(2000));
+        let ctx = ExecutionContext { executor_id: "s".into(), timestamp: 1, in_tee: false };
+        
+        let result = executor.execute_transaction(&tx, &ctx);
+        assert!(result.is_err(), "Should reject transfer exceeding balance");
     }
 }

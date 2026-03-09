@@ -14,7 +14,6 @@
 //! - Enclave passes through the bytes without parsing
 
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
 use crate::object::{Object, Address, ObjectId, generate_object_id};
 
 // ============================================================================
@@ -290,7 +289,7 @@ pub fn create_typed_coin(owner: Address, value: u64, coin_type: impl Into<String
 
 /// Generate deterministic coin ObjectId for an address and subnet
 /// 
-/// Convention: coin_object_id = SHA256("coin:" || address || ":" || subnet_id)
+/// Convention: `coin_object_id = BLAKE3("SETU_COIN_ID:" || address || ":" || subnet_id)`
 /// 
 /// This is the canonical ID generation used by both storage layer and runtime.
 /// Each subnet has exactly one native token (1:1 binding), so subnet_id
@@ -303,24 +302,34 @@ pub fn create_typed_coin(owner: Address, value: u64, coin_type: impl Into<String
 /// # Returns
 /// Deterministic 32-byte ObjectId
 pub fn deterministic_coin_id(owner: &Address, subnet_id: &str) -> ObjectId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"coin:");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"SETU_COIN_ID:");
     hasher.update(owner.to_string().as_bytes());
     hasher.update(b":");
     hasher.update(subnet_id.as_bytes());
-    ObjectId::new(hasher.finalize().into())
+    ObjectId::new(*hasher.finalize().as_bytes())
 }
 
 /// Generate deterministic coin ObjectId from string address
 /// 
 /// Convenience function for when you have a string address instead of Address.
+///
+/// **Important**: `owner` must be a canonical hex address (e.g., `"0x1234abcd..."`).
+/// Passing a plain name (e.g., `"alice"`) will produce a different ID than
+/// `deterministic_coin_id(&Address::from_str_id("alice"), ...)`.
+/// Use `Address::normalize()` to canonicalize first if needed.
 pub fn deterministic_coin_id_from_str(owner: &str, subnet_id: &str) -> ObjectId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"coin:");
+    debug_assert!(
+        owner.starts_with("0x") && owner.len() == 66,
+        "deterministic_coin_id_from_str: expected canonical hex address ('0x' + 64 hex chars), got '{}'",
+        owner
+    );
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"SETU_COIN_ID:");
     hasher.update(owner.as_bytes());
     hasher.update(b":");
     hasher.update(subnet_id.as_bytes());
-    ObjectId::new(hasher.finalize().into())
+    ObjectId::new(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]
@@ -482,17 +491,21 @@ mod tests {
     fn test_deterministic_coin_id() {
         use crate::object::ObjectId;
         
+        // Use canonical hex addresses (via Address::normalize → to_string)
+        let alice_hex = Address::from_str_id("alice").to_string();
+        let bob_hex = Address::from_str_id("bob").to_string();
+        
         // Test deterministic ID generation
-        let id1 = deterministic_coin_id_from_str("alice", "ROOT");
-        let id2 = deterministic_coin_id_from_str("alice", "ROOT");
+        let id1 = deterministic_coin_id_from_str(&alice_hex, "ROOT");
+        let id2 = deterministic_coin_id_from_str(&alice_hex, "ROOT");
         assert_eq!(id1, id2, "Same input should produce same ID");
         
         // Different address should produce different ID
-        let id3 = deterministic_coin_id_from_str("bob", "ROOT");
+        let id3 = deterministic_coin_id_from_str(&bob_hex, "ROOT");
         assert_ne!(id1, id3, "Different address should produce different ID");
         
         // Different subnet should produce different ID
-        let id4 = deterministic_coin_id_from_str("alice", "gaming-subnet");
+        let id4 = deterministic_coin_id_from_str(&alice_hex, "gaming-subnet");
         assert_ne!(id1, id4, "Different subnet should produce different ID");
         
         // Test Address-based version produces consistent IDs
@@ -501,9 +514,12 @@ mod tests {
         let id6 = deterministic_coin_id(&addr, "ROOT");
         assert_eq!(id5, id6, "Same Address should produce same ID");
         
+        // Address-based and string-based should match when using canonical hex
+        assert_eq!(id1, id5, "deterministic_coin_id and _from_str should match for canonical hex");
+        
         // Different subnets produce different IDs
-        let id_root = deterministic_coin_id_from_str("alice", "ROOT");
-        let id_other = deterministic_coin_id_from_str("alice", "OTHER");
+        let id_root = deterministic_coin_id_from_str(&alice_hex, "ROOT");
+        let id_other = deterministic_coin_id_from_str(&alice_hex, "OTHER");
         assert_ne!(id_root, id_other, "Different subnets should have different IDs");
     }
 }

@@ -79,7 +79,8 @@ impl InfraExecutor {
         let temp_store = InMemoryStateStore::new();
         let mut runtime = RuntimeExecutor::new(temp_store);
 
-        let owner = Address::from(registration.owner.as_str());
+        let owner = Address::from_hex(&registration.owner)
+            .map_err(|e| format!("Invalid owner address '{}': {}", registration.owner, e))?;
 
         let output = runtime.execute_subnet_register(
             &registration.subnet_id,
@@ -105,14 +106,10 @@ impl InfraExecutor {
         // Apply state changes to the actual state provider first
         self.apply_state_changes(&output)?;
 
-        // Set execution result
-        let state_changes: Vec<EventStateChange> = output.state_changes.iter().map(|sc| {
-            EventStateChange {
-                key: format!("object:{}", sc.object_id),
-                old_value: sc.old_state.clone(),
-                new_value: sc.new_state.clone(),
-            }
-        }).collect();
+        // Set execution result — use canonical "oid:{hex}" key format
+        let state_changes: Vec<EventStateChange> = output.state_changes.iter()
+            .map(|sc| sc.to_event_state_change())
+            .collect();
 
         event.set_execution_result(ExecutionResult {
             success: true,
@@ -154,7 +151,8 @@ impl InfraExecutor {
         let temp_store = InMemoryStateStore::new();
         let mut runtime = RuntimeExecutor::new(temp_store);
 
-        let user_address = Address::from(registration.address.as_str());
+        let user_address = Address::from_hex(&registration.address)
+            .map_err(|e| format!("Invalid user address '{}': {}", registration.address, e))?;
         let subnet_id = registration.subnet_id.as_deref().unwrap_or("subnet-0");
 
         let output = runtime.execute_user_register(
@@ -178,13 +176,10 @@ impl InfraExecutor {
         // Apply state changes first
         self.apply_state_changes(&output)?;
 
-        let state_changes: Vec<EventStateChange> = output.state_changes.iter().map(|sc| {
-            EventStateChange {
-                key: format!("object:{}", sc.object_id),
-                old_value: sc.old_state.clone(),
-                new_value: sc.new_state.clone(),
-            }
-        }).collect();
+        // Use canonical "oid:{hex}" key format
+        let state_changes: Vec<EventStateChange> = output.state_changes.iter()
+            .map(|sc| sc.to_event_state_change())
+            .collect();
 
         event.set_execution_result(ExecutionResult {
             success: true,
@@ -203,36 +198,20 @@ impl InfraExecutor {
     }
 
     /// Apply state changes to the MerkleStateProvider
+    ///
+    /// Routes through `apply_state_change()` which handles both SMT updates
+    /// AND coin index updates (coin_type_index, owner_coin_index).
     fn apply_state_changes(&self, output: &ExecutionOutput) -> Result<(), String> {
         // Get write access to the state manager
         let state_manager = self.state_provider.state_manager();
         let mut manager = state_manager.write()
             .map_err(|e| format!("Failed to acquire state manager lock: {}", e))?;
 
-        for state_change in &output.state_changes {
-            let object_id_bytes: [u8; 32] = *state_change.object_id.as_bytes();
-            
-            if let Some(ref new_state) = state_change.new_state {
-                // Insert or update
-                manager.upsert_object(
-                    SubnetId::ROOT,
-                    object_id_bytes,
-                    new_state.clone(),
-                );
-            } else {
-                // Delete (not commonly used for registration)
-                warn!(
-                    object_id = %state_change.object_id,
-                    "Delete operation in registration (unexpected)"
-                );
-            }
-        }
-
-        // Register coin types in the index for new coins
-        for object_id in &output.created_objects {
-            // If we created a coin, we need to register it in the index
-            // This requires parsing the state to get owner and coin_type
-            // For now, we rely on rebuild_coin_type_index at startup
+        for sc in &output.state_changes {
+            // Convert to event-layer StateChange with canonical "oid:{hex}" key format
+            // and route through apply_state_change for proper SMT + index updates
+            let event_sc = sc.to_event_state_change();
+            manager.apply_state_change(SubnetId::ROOT, &event_sc);
         }
 
         Ok(())
@@ -250,7 +229,7 @@ mod tests {
         let provider = Arc::new(MerkleStateProvider::new(state_manager));
         let executor = InfraExecutor::new("validator-1".to_string(), provider);
 
-        let registration = SubnetRegistration::new("subnet-test", "Test Subnet", "owner-addr", "TEST")
+        let registration = SubnetRegistration::new("subnet-test", "Test Subnet", "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf", "TEST")
             .with_initial_supply(1_000_000);
 
         let vlc = VLCSnapshot {
@@ -274,7 +253,7 @@ mod tests {
         let executor = InfraExecutor::new("validator-1".to_string(), provider);
 
         let registration = UserRegistration::from_metamask(
-            "0x1234567890abcdef1234567890abcdef12345678",
+            "0xc0a6c424ac7157ae408398df7e5f4552091a69125d5dfcb7b8c2659029395bdf",
             1000,
         ).with_subnet("subnet-0");
 

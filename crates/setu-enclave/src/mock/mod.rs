@@ -43,7 +43,6 @@ use setu_types::task::{
 use async_trait::async_trait;
 use setu_runtime::{RuntimeExecutor, ExecutionContext, InMemoryStateStore, StateStore};
 use setu_types::{EventId, create_coin, Address, Object, CoinData, ObjectId, Balance, CoinType};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -116,9 +115,10 @@ impl MockEnclave {
     }
     
     /// Initialize account with balance (for testing)
-    /// Creates a Coin object owned by the address
+    /// Creates a Coin object owned by the address (must be hex format)
     pub async fn init_account(&self, address: &str, balance: u64) {
-        let addr = Address::from(address);
+        let addr = Address::from_hex(address)
+            .expect("init_account requires valid hex address");
         let coin = create_coin(addr, balance);
         let coin_id = *coin.id();
         
@@ -166,7 +166,6 @@ impl MockEnclave {
                     .map_err(|e| StfError::InvalidResolvedInputs(format!("Invalid object ID: {}", e)))?;
                 
                 // TODO: Verify Merkle proof here (for production)
-                // let leaf_hash = sha256(entry.value);
                 // verify_proof(leaf_hash, entry.proof, pre_state_root)?;
                 
                 // Deserialize CoinState from BCS (raw storage format)
@@ -176,20 +175,20 @@ impl MockEnclave {
                     )))?;
                 
                 // Convert CoinState → Object<CoinData> for runtime
-                // CoinState.owner is stored in hex format ("0x..."), so use from_hex
-                // to avoid double-hashing. Address::from() would hash the hex string again.
+                // CoinState.owner is stored in hex format ("0x..."), use from_hex.
                 let owner = Address::from_hex(&coin_state.owner)
-                    .unwrap_or_else(|_| Address::from(coin_state.owner.as_str()));
+                    .map_err(|e| StfError::InvalidResolvedInputs(format!(
+                        "Invalid owner address in CoinState {}: {}", hex_id, e
+                    )))?;
                 let coin_data = CoinData {
                     coin_type: CoinType::new(&coin_state.coin_type),
                     balance: Balance::new(coin_state.balance),
                 };
                 
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                
+                // Use deterministic timestamp (0) instead of SystemTime::now().
+                // created_at / updated_at are NOT included in CoinState (the consensus-
+                // critical BCS format), so they don't affect state hashes or conflict
+                // detection. Using 0 eliminates non-determinism in the TEE path.
                 let coin_object = Object {
                     metadata: setu_types::ObjectMetadata {
                         id: object_id,
@@ -198,8 +197,8 @@ impl MockEnclave {
                         object_type: setu_types::ObjectType::OwnedObject,
                         owner: Some(owner),
                         ownership: setu_types::Ownership::AddressOwner(owner),
-                        created_at: now,
-                        updated_at: now,
+                        created_at: 0,
+                        updated_at: 0,
                     },
                     data: coin_data,
                 };
@@ -343,7 +342,7 @@ impl MockEnclave {
             return self.execute_transfer_via_runtime(event, transfer, resolved_inputs, diff).await;
         }
         
-        // Infrastructure events (SubnetRegister, UserRegister) should NEVER reach TEE.
+        // Infrastructure / root events should NEVER reach TEE.
         // They are executed directly by Validator via InfraExecutor.
         // If we receive such events here, it indicates a routing bug.
         // See: types/src/event.rs - EventType::is_validator_executed()
@@ -355,6 +354,10 @@ impl MockEnclave {
             setu_types::event::EventPayload::UserRegister(_) => {
                 warn!(event_id = %event.id, "UserRegister event incorrectly routed to TEE - should use InfraExecutor");
                 return Err("UserRegister is a Validator-executed event, should not reach TEE".to_string());
+            }
+            setu_types::event::EventPayload::ContractPublish { .. } => {
+                warn!(event_id = %event.id, "ContractPublish event incorrectly routed to TEE - should use InfraExecutor");
+                return Err("ContractPublish is a Validator-executed event, should not reach TEE".to_string());
             }
             _ => {}
         }
@@ -385,7 +388,7 @@ impl MockEnclave {
             ).await;
         }
         
-        // Infrastructure events (SubnetRegister, UserRegister) should NEVER reach TEE.
+        // Infrastructure / root events should NEVER reach TEE.
         // They are executed directly by Validator via InfraExecutor.
         // If we receive such events here, it indicates a routing bug.
         match &event.payload {
@@ -396,6 +399,10 @@ impl MockEnclave {
             setu_types::event::EventPayload::UserRegister(_) => {
                 warn!(event_id = %event.id, "UserRegister event incorrectly routed to TEE - should use InfraExecutor");
                 return Err("UserRegister is a Validator-executed event, should not reach TEE".to_string());
+            }
+            setu_types::event::EventPayload::ContractPublish { .. } => {
+                warn!(event_id = %event.id, "ContractPublish event incorrectly routed to TEE - should use InfraExecutor");
+                return Err("ContractPublish is a Validator-executed event, should not reach TEE".to_string());
             }
             _ => {}
         }
@@ -564,8 +571,14 @@ impl MockEnclave {
     }
     
     /// Compute post-state root from state
+    ///
+    /// WARNING: This uses a simple hash over sorted key-value pairs, which does NOT match
+    /// the real SMT state root computation. This mock should be replaced
+    /// with an actual SMT instance for accurate testing.
+    #[deprecated(since = "0.3.0", note = "Mock state root uses simple hash, not SMT. Replace with real SMT for accurate testing.")]
     fn compute_state_root(state: &HashMap<String, Vec<u8>>) -> [u8; 32] {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_MOCK_STATE:");
         
         // Sort keys for determinism
         let mut keys: Vec<_> = state.keys().collect();
@@ -578,7 +591,7 @@ impl MockEnclave {
             }
         }
         
-        hasher.finalize().into()
+        *hasher.finalize().as_bytes()
     }
     
     /// Compute hash of output for attestation user_data
@@ -591,12 +604,13 @@ impl MockEnclave {
         post_state_root: &[u8; 32],
         diff_commitment: &[u8; 32],
     ) -> [u8; 32] {
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"SETU_OUTPUT_HASH:");
         hasher.update(subnet_id.as_bytes());
         hasher.update(pre_state_root);
         hasher.update(post_state_root);
         hasher.update(diff_commitment);
-        hasher.finalize().into()
+        *hasher.finalize().as_bytes()
     }
 }
 

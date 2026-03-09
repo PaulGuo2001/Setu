@@ -177,7 +177,7 @@ impl TaskPreparer {
         
         let read_set = vec![
             ReadSetEntry::new(
-                format!("coin:{}", hex::encode(&selected_coin.object_id)),
+                format!("oid:{}", hex::encode(&selected_coin.object_id)),
                 coin_data,
             ).with_proof(
                 merkle_proof
@@ -343,7 +343,7 @@ impl TaskPreparer {
         
         let read_set = vec![
             setu_types::task::ReadSetEntry::new(
-                format!("coin:{}", hex::encode(&selected_coin.object_id)),
+                format!("oid:{}", hex::encode(&selected_coin.object_id)),
                 coin_data,
             ).with_proof(
                 merkle_proof
