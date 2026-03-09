@@ -106,14 +106,10 @@ impl InfraExecutor {
         // Apply state changes to the actual state provider first
         self.apply_state_changes(&output)?;
 
-        // Set execution result
-        let state_changes: Vec<EventStateChange> = output.state_changes.iter().map(|sc| {
-            EventStateChange {
-                key: format!("object:{}", sc.object_id),
-                old_value: sc.old_state.clone(),
-                new_value: sc.new_state.clone(),
-            }
-        }).collect();
+        // Set execution result — use canonical "oid:{hex}" key format
+        let state_changes: Vec<EventStateChange> = output.state_changes.iter()
+            .map(|sc| sc.to_event_state_change())
+            .collect();
 
         event.set_execution_result(ExecutionResult {
             success: true,
@@ -180,13 +176,10 @@ impl InfraExecutor {
         // Apply state changes first
         self.apply_state_changes(&output)?;
 
-        let state_changes: Vec<EventStateChange> = output.state_changes.iter().map(|sc| {
-            EventStateChange {
-                key: format!("object:{}", sc.object_id),
-                old_value: sc.old_state.clone(),
-                new_value: sc.new_state.clone(),
-            }
-        }).collect();
+        // Use canonical "oid:{hex}" key format
+        let state_changes: Vec<EventStateChange> = output.state_changes.iter()
+            .map(|sc| sc.to_event_state_change())
+            .collect();
 
         event.set_execution_result(ExecutionResult {
             success: true,
@@ -205,36 +198,20 @@ impl InfraExecutor {
     }
 
     /// Apply state changes to the MerkleStateProvider
+    ///
+    /// Routes through `apply_state_change()` which handles both SMT updates
+    /// AND coin index updates (coin_type_index, owner_coin_index).
     fn apply_state_changes(&self, output: &ExecutionOutput) -> Result<(), String> {
         // Get write access to the state manager
         let state_manager = self.state_provider.state_manager();
         let mut manager = state_manager.write()
             .map_err(|e| format!("Failed to acquire state manager lock: {}", e))?;
 
-        for state_change in &output.state_changes {
-            let object_id_bytes: [u8; 32] = *state_change.object_id.as_bytes();
-            
-            if let Some(ref new_state) = state_change.new_state {
-                // Insert or update
-                manager.upsert_object(
-                    SubnetId::ROOT,
-                    object_id_bytes,
-                    new_state.clone(),
-                );
-            } else {
-                // Delete (not commonly used for registration)
-                warn!(
-                    object_id = %state_change.object_id,
-                    "Delete operation in registration (unexpected)"
-                );
-            }
-        }
-
-        // Register coin types in the index for new coins
-        for object_id in &output.created_objects {
-            // If we created a coin, we need to register it in the index
-            // This requires parsing the state to get owner and coin_type
-            // For now, we rely on rebuild_coin_type_index at startup
+        for sc in &output.state_changes {
+            // Convert to event-layer StateChange with canonical "oid:{hex}" key format
+            // and route through apply_state_change for proper SMT + index updates
+            let event_sc = sc.to_event_state_change();
+            manager.apply_state_change(SubnetId::ROOT, &event_sc);
         }
 
         Ok(())
