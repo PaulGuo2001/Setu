@@ -1,5 +1,6 @@
 // ========== Core Modules ==========
 pub mod hash_utils;     // Unified hash utilities (BLAKE3 + SHA256)
+pub mod state_key;      // Storage key format constants and helpers
 pub mod event;
 pub mod transfer;       // Transfer and routing types
 pub mod registration;   // Registration types
@@ -37,6 +38,9 @@ pub use event::{
     Event, EventId, EventStatus, EventType, EventPayload,
     ExecutionResult, StateChange,
 };
+
+// State key format helpers
+pub use state_key::{object_key, parse_object_key, is_known_metadata_key};
 
 // Export from consensus module
 pub use consensus::{Anchor, AnchorId, ConsensusFrame, CFId, CFStatus, Vote, ConsensusConfig};
