@@ -237,3 +237,22 @@ This is validated by unit tests:
 - Gas accounting/enforcement
 - Module publish/upgrade semantics
 
+## 11. Sui Bridge (Experimental)
+
+An experimental bridge is implemented in `sui_bridge.rs`:
+
+1. Compile Sui package with `sui move build --disassemble`.
+2. Read `<module>.mvb` disassembly text.
+3. Validate supported Sui entry patterns.
+4. Translate supported entries into Setu VM `Program`.
+
+Currently supported translation patterns:
+
+- `mint`: `coin::mint<T>` + `transfer::public_transfer<Coin<T>>`
+- `burn`: `coin::burn<T>` + `Pop`
+
+Important limitations:
+
+- This is **pattern translation**, not native execution of Sui bytecode.
+- Treasury capability checks and full Sui object semantics are not fully modeled.
+- `burn` is mapped to consuming/deleting a Setu coin object.

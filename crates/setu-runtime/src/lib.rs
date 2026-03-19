@@ -11,6 +11,7 @@ pub mod error;
 pub mod executor;
 pub mod program_vm;
 pub mod state;
+pub mod sui_bridge;
 pub mod transaction;
 
 pub use error::{RuntimeError, RuntimeResult};
@@ -19,4 +20,8 @@ pub use executor::{
 };
 pub use program_vm::{BuiltinFunction, Instruction, Program, VmConstant};
 pub use state::{InMemoryStateStore, StateStore};
+pub use sui_bridge::{
+    compile_package_to_disassembly, translate_burn_from_disassembly,
+    translate_mint_from_disassembly, SuiBurnCall, SuiMintCall,
+};
 pub use transaction::{ProgramTx, QueryTx, Transaction, TransactionType, TransferTx};
