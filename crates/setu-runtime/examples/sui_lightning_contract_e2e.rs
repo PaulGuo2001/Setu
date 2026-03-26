@@ -5,12 +5,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use setu_runtime::{
-    compile_package_to_disassembly, execute_sui_entry_from_disassembly, InMemoryStateStore,
-    StateStore, SuiVmArg,
+    compile_package_to_disassembly, execute_sui_entry_from_disassembly,
+    execute_sui_entry_with_outcome, InMemoryStateStore, StateStore, SuiVmArg,
+    SuiVmExecutionOutcome,
 };
-use setu_types::{deterministic_coin_id, Address, Object, ObjectId};
+use setu_types::{deterministic_coin_id, hash_utils::sha256_hash, Address, Object, ObjectId};
 
-// Lightning contract + a VM-subset-compatible entry used for direct Sui subset execution.
+// Lightning contract executed directly by the Setu Sui disassembly VM.
 const CONTRACT: &str = r#"module lightning_pkg::lightning {
     use sui::object::{Self, ID, UID};
     use sui::transfer;
@@ -232,20 +233,6 @@ const CONTRACT: &str = r#"module lightning_pkg::lightning {
         });
     }
 
-    // New-paradigm compatibility entry:
-    // uses only the currently implemented direct Sui subset VM opcodes/calls.
-    public entry fun vm_subset_branch_transfer(
-        coin: Coin<SUI>,
-        recipient_true: address,
-        recipient_false: address,
-        should_transfer: bool,
-    ) {
-        if (should_transfer) {
-            transfer::public_transfer(coin, recipient_true);
-        } else {
-            transfer::public_transfer(coin, recipient_false);
-        };
-    }
 }"#;
 
 fn main() -> Result<()> {
@@ -263,98 +250,121 @@ fn main() -> Result<()> {
     require_contains(&disassembly, "public htlc_claim(")?;
     require_contains(&disassembly, "public htlc_timeout(")?;
     require_contains(&disassembly, "public penalize(")?;
-    require_contains(&disassembly, "entry public vm_subset_branch_transfer(")?;
-    println!("Detected lightning functions and subset-compatible entry in disassembly");
+    println!("Detected target lightning functions in disassembly");
 
     let mut state = InMemoryStateStore::new();
     let alice = Address::from_str_id("alice");
     let bob = Address::from_str_id("bob");
-    let carol = Address::from_str_id("carol");
 
-    // Case 1: should_transfer=true -> transfer to bob
-    let coin_true_id = deterministic_coin_id(&alice, "SUI");
-    let coin_true = Object::new_owned(
-        coin_true_id,
+    let funding_coin_id = deterministic_coin_id(&alice, "SUI");
+    let funding_coin = Object::new_owned(
+        funding_coin_id,
         alice,
         setu_types::CoinData {
             coin_type: setu_types::CoinType::new("SUI"),
-            balance: setu_types::Balance::new(300),
+            balance: setu_types::Balance::new(1_000),
         },
     );
-    state.set_object(coin_true_id, coin_true)?;
+    state.set_object(funding_coin_id, funding_coin)?;
+
+    // Scenario A: open -> cooperative close
+    let open_a = execute_sui_entry_with_outcome(
+        &mut state,
+        &alice,
+        &disassembly,
+        "open_channel",
+        &[
+            SuiVmArg::ObjectId(funding_coin_id),
+            SuiVmArg::U64(400),
+            SuiVmArg::Bytes(vec![0x02; 33]),
+            SuiVmArg::Bytes(vec![0x03; 33]),
+            SuiVmArg::Address(bob),
+            SuiVmArg::U64(5),
+            SuiVmArg::TxContextEpoch(10),
+        ],
+    )?;
+    let channel_a_id = find_new_vm_object(&state, &open_a, &[])?;
 
     execute_sui_entry_from_disassembly(
         &mut state,
         &alice,
         &disassembly,
-        "vm_subset_branch_transfer",
+        "close_channel",
         &[
-            SuiVmArg::ObjectId(coin_true_id),
-            SuiVmArg::Address(bob),
-            SuiVmArg::Address(carol),
-            SuiVmArg::Bool(true),
+            SuiVmArg::ObjectId(channel_a_id),
+            SuiVmArg::U64(1),
+            SuiVmArg::U64(350),
+            SuiVmArg::U64(50),
+            SuiVmArg::Bytes(vec![0x11; 65]),
+            SuiVmArg::Bytes(vec![0x22; 65]),
+            SuiVmArg::TxContextEpoch(11),
         ],
     )?;
 
-    let bob_coin_id = deterministic_coin_id(&bob, "SUI");
-    let bob_coin = state
-        .get_object(&bob_coin_id)?
-        .context("bob coin missing after true branch")?;
-    if bob_coin.data.balance.value() != 300 {
-        bail!(
-            "expected bob balance 300 after true branch, got {}",
-            bob_coin.data.balance.value()
-        );
-    }
-    if state.get_object(&coin_true_id)?.is_some() {
-        bail!("source coin was not consumed in true branch");
-    }
+    // Scenario B: open -> force_close -> penalize
+    let open_b = execute_sui_entry_with_outcome(
+        &mut state,
+        &alice,
+        &disassembly,
+        "open_channel",
+        &[
+            SuiVmArg::ObjectId(funding_coin_id),
+            SuiVmArg::U64(200),
+            SuiVmArg::Bytes(vec![0x02; 33]),
+            SuiVmArg::Bytes(vec![0x03; 33]),
+            SuiVmArg::Address(bob),
+            SuiVmArg::U64(7),
+            SuiVmArg::TxContextEpoch(20),
+        ],
+    )?;
+    let channel_b_id = find_new_vm_object(&state, &open_b, &[channel_a_id])?;
 
-    // Case 2: should_transfer=false -> transfer to carol
-    let coin_false_id = ObjectId::new([0x22; 32]);
-    let coin_false = Object::new_owned(
-        coin_false_id,
-        alice,
-        setu_types::CoinData {
-            coin_type: setu_types::CoinType::new("SUI"),
-            balance: setu_types::Balance::new(180),
-        },
-    );
-    state.set_object(coin_false_id, coin_false)?;
+    let revocation_secret = b"lightning-secret".to_vec();
+    let revocation_hash = sha256_hash(&revocation_secret).to_vec();
 
     execute_sui_entry_from_disassembly(
         &mut state,
         &alice,
         &disassembly,
-        "vm_subset_branch_transfer",
+        "force_close",
         &[
-            SuiVmArg::ObjectId(coin_false_id),
-            SuiVmArg::Address(bob),
-            SuiVmArg::Address(carol),
-            SuiVmArg::Bool(false),
+            SuiVmArg::ObjectId(channel_b_id),
+            SuiVmArg::U64(2),
+            SuiVmArg::Bytes(revocation_hash),
+            SuiVmArg::Bytes(vec![0x33; 65]),
+            SuiVmArg::TxContextEpoch(21),
         ],
     )?;
 
-    let carol_coin_id = deterministic_coin_id(&carol, "SUI");
-    let carol_coin = state
-        .get_object(&carol_coin_id)?
-        .context("carol coin missing after false branch")?;
-    if carol_coin.data.balance.value() != 180 {
+    execute_sui_entry_from_disassembly(
+        &mut state,
+        &alice,
+        &disassembly,
+        "penalize",
+        &[
+            SuiVmArg::ObjectId(channel_b_id),
+            SuiVmArg::Bytes(revocation_secret),
+            SuiVmArg::TxContextEpoch(22),
+        ],
+    )?;
+
+    let funding_after = state
+        .get_object(&funding_coin_id)?
+        .context("funding coin missing after lightning execution")?;
+    if funding_after.data.balance.value() != 400 {
         bail!(
-            "expected carol balance 180 after false branch, got {}",
-            carol_coin.data.balance.value()
+            "expected remaining funding balance 400, got {}",
+            funding_after.data.balance.value()
         );
-    }
-    if state.get_object(&coin_false_id)?.is_some() {
-        bail!("source coin was not consumed in false branch");
     }
 
     println!(
-        "Direct Sui subset VM on lightning module succeeded: bob={}, carol={}",
-        bob_coin.data.balance.value(),
-        carol_coin.data.balance.value()
+        "Lightning direct Sui VM execution succeeded: channel_a={}, channel_b={}, funding_left={}",
+        channel_a_id,
+        channel_b_id,
+        funding_after.data.balance.value()
     );
-    println!("\nLightning E2E (compile + direct Sui subset VM execution) completed.");
+    println!("\nLightning E2E (compile + original-function execution) completed.");
 
     Ok(())
 }
@@ -391,4 +401,20 @@ fn require_contains(text: &str, needle: &str) -> Result<()> {
         bail!("Disassembly missing expected pattern: {}", needle);
     }
     Ok(())
+}
+
+fn find_new_vm_object(
+    state: &InMemoryStateStore,
+    outcome: &SuiVmExecutionOutcome,
+    exclude: &[ObjectId],
+) -> Result<ObjectId> {
+    for write in &outcome.writes {
+        if exclude.iter().any(|id| id == &write.object_id) {
+            continue;
+        }
+        if state.get_vm_object(&write.object_id)?.is_some() {
+            return Ok(write.object_id);
+        }
+    }
+    bail!("No new VM object found in execution outcome");
 }
