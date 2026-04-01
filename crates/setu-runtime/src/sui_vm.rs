@@ -113,7 +113,17 @@ enum SuiOpcode {
 #[derive(Debug, Clone)]
 struct ParsedFunction {
     param_types: Vec<String>,
+    return_count: usize,
+    locals_count: usize,
     instructions: Vec<(usize, SuiOpcode)>,
+}
+
+#[derive(Debug, Clone)]
+struct CallFrame {
+    instructions: Vec<(usize, SuiOpcode)>,
+    instruction_pc: HashMap<usize, usize>,
+    locals: Vec<Option<SuiVmValue>>,
+    stack: Vec<SuiVmValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,18 +156,15 @@ pub fn execute_sui_entry_with_outcome<S: StateStore>(
     function_name: &str,
     args: &[SuiVmArg],
 ) -> RuntimeResult<SuiVmExecutionOutcome> {
-    let function = parse_entry_function(disassembly, function_name)?;
-    let mut vm = SuiDisasmVm::new(state, sender, function, args)?;
-    vm.run()
+    let mut vm = SuiDisasmVm::new(state, sender, disassembly);
+    vm.run(function_name, args)
 }
 
 struct SuiDisasmVm<'a, S: StateStore> {
     state: &'a mut S,
     sender: &'a Address,
-    instructions: Vec<(usize, SuiOpcode)>,
-    instruction_pc: HashMap<usize, usize>,
-    locals: Vec<Option<SuiVmValue>>,
-    stack: Vec<SuiVmValue>,
+    disassembly: &'a str,
+    functions: HashMap<String, ParsedFunction>,
     temp_counter: u64,
     write_order: Vec<ObjectId>,
     old_states: HashMap<ObjectId, Option<Vec<u8>>>,
@@ -165,12 +172,41 @@ struct SuiDisasmVm<'a, S: StateStore> {
 }
 
 impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
-    fn new(
-        state: &'a mut S,
-        sender: &'a Address,
-        function: ParsedFunction,
+    fn new(state: &'a mut S, sender: &'a Address, disassembly: &'a str) -> Self {
+        Self {
+            state,
+            sender,
+            disassembly,
+            functions: HashMap::new(),
+            temp_counter: 1,
+            write_order: Vec::new(),
+            old_states: HashMap::new(),
+            final_states: HashMap::new(),
+        }
+    }
+
+    fn run(
+        &mut self,
+        function_name: &str,
         args: &[SuiVmArg],
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<SuiVmExecutionOutcome> {
+        let returned = self.execute_entry_function(function_name, args)?;
+        if !returned.is_empty() {
+            return Err(RuntimeError::ProgramExecution(format!(
+                "Entry function '{}' returned {} values unexpectedly",
+                function_name,
+                returned.len()
+            )));
+        }
+        self.finish()
+    }
+
+    fn execute_entry_function(
+        &mut self,
+        function_name: &str,
+        args: &[SuiVmArg],
+    ) -> RuntimeResult<Vec<SuiVmValue>> {
+        let function = self.load_function(function_name)?.clone();
         if args.len() != function.param_types.len() {
             return Err(RuntimeError::ProgramExecution(format!(
                 "Arg count mismatch: expected {}, got {}",
@@ -179,49 +215,64 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
             )));
         }
 
-        let max_local = function
-            .instructions
-            .iter()
-            .filter_map(|(_, op)| match op {
-                SuiOpcode::MoveLoc(idx) | SuiOpcode::CopyLoc(idx) | SuiOpcode::StLoc(idx) => {
-                    Some(*idx)
-                }
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
-        let locals_count = usize::max(function.param_types.len(), max_local + 1);
-        let mut locals = vec![None; locals_count];
-
+        let mut locals = vec![None; function.locals_count];
         for (idx, (arg, param_ty)) in args.iter().zip(function.param_types.iter()).enumerate() {
-            locals[idx] = Some(Self::coerce_arg(state, arg, param_ty)?);
+            locals[idx] = Some(Self::coerce_arg(self.state, arg, param_ty)?);
         }
 
+        let mut frame = Self::build_frame(&function, locals);
+        self.run_frame(function_name, &function, &mut frame)
+    }
+
+    fn execute_user_function(
+        &mut self,
+        function_name: &str,
+        args: &[SuiVmValue],
+    ) -> RuntimeResult<Vec<SuiVmValue>> {
+        let function = self.load_function(function_name)?.clone();
+        if args.len() != function.param_types.len() {
+            return Err(RuntimeError::ProgramExecution(format!(
+                "Call {} expects {} args, got {}",
+                function_name,
+                function.param_types.len(),
+                args.len()
+            )));
+        }
+
+        let mut locals = vec![None; function.locals_count];
+        for (idx, (arg, param_ty)) in args.iter().zip(function.param_types.iter()).enumerate() {
+            locals[idx] = Some(Self::coerce_value(arg, param_ty)?);
+        }
+
+        let mut frame = Self::build_frame(&function, locals);
+        self.run_frame(function_name, &function, &mut frame)
+    }
+
+    fn build_frame(function: &ParsedFunction, locals: Vec<Option<SuiVmValue>>) -> CallFrame {
         let mut instruction_pc = HashMap::new();
         for (pc, (inst_idx, _)) in function.instructions.iter().enumerate() {
             instruction_pc.insert(*inst_idx, pc);
         }
 
-        Ok(Self {
-            state,
-            sender,
-            instructions: function.instructions,
+        CallFrame {
+            instructions: function.instructions.clone(),
             instruction_pc,
             locals,
             stack: Vec::new(),
-            temp_counter: 1,
-            write_order: Vec::new(),
-            old_states: HashMap::new(),
-            final_states: HashMap::new(),
-        })
+        }
     }
 
-    fn run(&mut self) -> RuntimeResult<SuiVmExecutionOutcome> {
+    fn run_frame(
+        &mut self,
+        function_name: &str,
+        function: &ParsedFunction,
+        frame: &mut CallFrame,
+    ) -> RuntimeResult<Vec<SuiVmValue>> {
         let mut pc = 0usize;
         let step_limit = 100_000usize;
         let mut steps = 0usize;
 
-        while pc < self.instructions.len() {
+        while pc < frame.instructions.len() {
             if steps >= step_limit {
                 return Err(RuntimeError::ProgramExecution(
                     "Sui VM step limit exceeded".to_string(),
@@ -229,63 +280,65 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
             }
             steps += 1;
 
-            let (_, op) = self.instructions[pc].clone();
+            let (_, op) = frame.instructions[pc].clone();
             pc += 1;
 
             match op {
                 SuiOpcode::MoveLoc(idx) => {
-                    let slot = self.locals.get_mut(idx).ok_or_else(|| {
+                    let slot = frame.locals.get_mut(idx).ok_or_else(|| {
                         RuntimeError::ProgramExecution(format!("Invalid local index {}", idx))
                     })?;
                     let v = slot.take().ok_or_else(|| {
                         RuntimeError::ProgramExecution(format!("Local {} is uninitialized", idx))
                     })?;
-                    self.stack.push(v);
+                    frame.stack.push(v);
                 }
                 SuiOpcode::CopyLoc(idx) => {
-                    let v = self.local_get(idx)?.clone();
-                    self.stack.push(v);
+                    let v = Self::local_get(frame, idx)?.clone();
+                    frame.stack.push(v);
                 }
                 SuiOpcode::StLoc(idx) => {
-                    let v = self.pop()?;
-                    let slot = self.locals.get_mut(idx).ok_or_else(|| {
+                    let v = Self::pop(&mut frame.stack)?;
+                    let slot = frame.locals.get_mut(idx).ok_or_else(|| {
                         RuntimeError::ProgramExecution(format!("Invalid local index {}", idx))
                     })?;
                     *slot = Some(v);
                 }
-                SuiOpcode::LdU64(v) => self.stack.push(SuiVmValue::U64(v)),
-                SuiOpcode::LdU8(v) => self.stack.push(SuiVmValue::U64(v as u64)),
-                SuiOpcode::LdTrue => self.stack.push(SuiVmValue::Bool(true)),
-                SuiOpcode::LdFalse => self.stack.push(SuiVmValue::Bool(false)),
+                SuiOpcode::LdU64(v) => frame.stack.push(SuiVmValue::U64(v)),
+                SuiOpcode::LdU8(v) => frame.stack.push(SuiVmValue::U64(v as u64)),
+                SuiOpcode::LdTrue => frame.stack.push(SuiVmValue::Bool(true)),
+                SuiOpcode::LdFalse => frame.stack.push(SuiVmValue::Bool(false)),
                 SuiOpcode::BrFalse(target) => {
-                    if !self.pop_bool()? {
-                        pc = self.jump_target(target)?;
+                    if !Self::pop_bool(&mut frame.stack)? {
+                        pc = Self::jump_target(frame, target)?;
                     }
                 }
                 SuiOpcode::BrTrue(target) => {
-                    if self.pop_bool()? {
-                        pc = self.jump_target(target)?;
+                    if Self::pop_bool(&mut frame.stack)? {
+                        pc = Self::jump_target(frame, target)?;
                     }
                 }
                 SuiOpcode::Branch(target) => {
-                    pc = self.jump_target(target)?;
+                    pc = Self::jump_target(frame, target)?;
                 }
                 SuiOpcode::Call {
                     function,
                     arg_count,
                 } => {
-                    self.execute_call(&function, arg_count)?;
+                    let returned = self.execute_call(frame, &function, arg_count)?;
+                    frame.stack.extend(returned);
                 }
                 SuiOpcode::Pop => {
-                    let _ = self.pop()?;
+                    let _ = Self::pop(&mut frame.stack)?;
                 }
-                SuiOpcode::Ret => return self.finish(),
+                SuiOpcode::Ret => return Self::finish_frame(function_name, function, frame),
             }
         }
 
-        Err(RuntimeError::ProgramExecution(
-            "Function terminated without Ret".to_string(),
-        ))
+        Err(RuntimeError::ProgramExecution(format!(
+            "Function '{}' terminated without Ret",
+            function_name
+        )))
     }
 
     fn finish(&mut self) -> RuntimeResult<SuiVmExecutionOutcome> {
@@ -354,25 +407,50 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
         Ok(SuiVmValue::Opaque)
     }
 
-    fn jump_target(&self, target: usize) -> RuntimeResult<usize> {
-        self.instruction_pc.get(&target).copied().ok_or_else(|| {
+    fn coerce_value(arg: &SuiVmValue, param_type: &str) -> RuntimeResult<SuiVmValue> {
+        match (param_type, arg) {
+            ("u64", SuiVmValue::U64(_))
+            | ("bool", SuiVmValue::Bool(_))
+            | ("address", SuiVmValue::Address(_)) => Ok(arg.clone()),
+            (ty, SuiVmValue::Coin(_)) if ty.starts_with("Coin<") => Ok(arg.clone()),
+            _ => Ok(arg.clone()),
+        }
+    }
+
+    fn load_function(&mut self, function_name: &str) -> RuntimeResult<&ParsedFunction> {
+        if !self.functions.contains_key(function_name) {
+            let parsed = parse_function_by_name(self.disassembly, function_name)?;
+            self.functions.insert(function_name.to_string(), parsed);
+        }
+        self.functions.get(function_name).ok_or_else(|| {
+            RuntimeError::ProgramExecution(format!("Function '{}' not found", function_name))
+        })
+    }
+
+    fn jump_target(frame: &CallFrame, target: usize) -> RuntimeResult<usize> {
+        frame.instruction_pc.get(&target).copied().ok_or_else(|| {
             RuntimeError::ProgramExecution(format!("Invalid branch target {}", target))
         })
     }
 
-    fn execute_call(&mut self, function: &str, arg_count: usize) -> RuntimeResult<()> {
-        if self.stack.len() < arg_count {
+    fn execute_call(
+        &mut self,
+        frame: &mut CallFrame,
+        function: &str,
+        arg_count: usize,
+    ) -> RuntimeResult<Vec<SuiVmValue>> {
+        if frame.stack.len() < arg_count {
             return Err(RuntimeError::ProgramExecution(format!(
                 "Call {} expects {} args, stack has {}",
                 function,
                 arg_count,
-                self.stack.len()
+                frame.stack.len()
             )));
         }
 
         let mut args = Vec::with_capacity(arg_count);
         for _ in 0..arg_count {
-            args.push(self.pop()?);
+            args.push(Self::pop(&mut frame.stack)?);
         }
         args.reverse();
 
@@ -383,14 +461,15 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
         } else if function.starts_with("coin::burn<") {
             self.call_coin_burn(&args)
         } else {
-            Err(RuntimeError::ProgramExecution(format!(
-                "Unsupported Sui native call '{}'",
-                function
-            )))
+            self.execute_user_function(function, &args)
         }
     }
 
-    fn call_coin_mint(&mut self, function: &str, args: &[SuiVmValue]) -> RuntimeResult<()> {
+    fn call_coin_mint(
+        &mut self,
+        function: &str,
+        args: &[SuiVmValue],
+    ) -> RuntimeResult<Vec<SuiVmValue>> {
         if args.len() != 3 {
             return Err(RuntimeError::ProgramExecution(format!(
                 "coin::mint expects 3 args, got {}",
@@ -417,11 +496,10 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
                 balance: Balance::new(amount),
             },
         );
-        self.stack.push(SuiVmValue::Coin(coin));
-        Ok(())
+        Ok(vec![SuiVmValue::Coin(coin)])
     }
 
-    fn call_public_transfer(&mut self, args: &[SuiVmValue]) -> RuntimeResult<()> {
+    fn call_public_transfer(&mut self, args: &[SuiVmValue]) -> RuntimeResult<Vec<SuiVmValue>> {
         if args.len() != 2 {
             return Err(RuntimeError::ProgramExecution(format!(
                 "transfer::public_transfer expects 2 args, got {}",
@@ -476,10 +554,10 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
             self.set_object_tracked(recipient_coin_id, new_coin)?;
         }
 
-        Ok(())
+        Ok(vec![])
     }
 
-    fn call_coin_burn(&mut self, args: &[SuiVmValue]) -> RuntimeResult<()> {
+    fn call_coin_burn(&mut self, args: &[SuiVmValue]) -> RuntimeResult<Vec<SuiVmValue>> {
         if args.len() != 2 {
             return Err(RuntimeError::ProgramExecution(format!(
                 "coin::burn expects 2 args, got {}",
@@ -500,8 +578,7 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
         if self.state.get_object(&object_id)?.is_some() {
             self.delete_object_tracked(&object_id)?;
         }
-        self.stack.push(SuiVmValue::U64(0));
-        Ok(())
+        Ok(vec![SuiVmValue::U64(0)])
     }
 
     fn next_temp_object_id(&mut self) -> ObjectId {
@@ -512,8 +589,9 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
         ObjectId::new(bytes)
     }
 
-    fn local_get(&self, idx: usize) -> RuntimeResult<&SuiVmValue> {
-        self.locals
+    fn local_get(frame: &CallFrame, idx: usize) -> RuntimeResult<&SuiVmValue> {
+        frame
+            .locals
             .get(idx)
             .ok_or_else(|| RuntimeError::ProgramExecution(format!("Invalid local index {}", idx)))?
             .as_ref()
@@ -522,14 +600,14 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
             })
     }
 
-    fn pop(&mut self) -> RuntimeResult<SuiVmValue> {
-        self.stack
+    fn pop(stack: &mut Vec<SuiVmValue>) -> RuntimeResult<SuiVmValue> {
+        stack
             .pop()
             .ok_or_else(|| RuntimeError::ProgramExecution("Stack underflow".to_string()))
     }
 
-    fn pop_bool(&mut self) -> RuntimeResult<bool> {
-        match self.pop()? {
+    fn pop_bool(stack: &mut Vec<SuiVmValue>) -> RuntimeResult<bool> {
+        match Self::pop(stack)? {
             SuiVmValue::Bool(v) => Ok(v),
             other => Err(RuntimeError::ProgramExecution(format!(
                 "Expected bool, got {:?}",
@@ -570,9 +648,35 @@ impl<'a, S: StateStore> SuiDisasmVm<'a, S> {
         self.final_states.insert(*object_id, None);
         Ok(())
     }
+
+    fn finish_frame(
+        function_name: &str,
+        function: &ParsedFunction,
+        frame: &mut CallFrame,
+    ) -> RuntimeResult<Vec<SuiVmValue>> {
+        if frame.stack.len() < function.return_count {
+            return Err(RuntimeError::ProgramExecution(format!(
+                "Function '{}' expected {} return values, stack has {}",
+                function_name,
+                function.return_count,
+                frame.stack.len()
+            )));
+        }
+
+        let split = frame.stack.len() - function.return_count;
+        let returns = frame.stack.split_off(split);
+        if !frame.stack.is_empty() {
+            return Err(RuntimeError::ProgramExecution(format!(
+                "Function '{}' left {} extra values on the stack",
+                function_name,
+                frame.stack.len()
+            )));
+        }
+        Ok(returns)
+    }
 }
 
-fn parse_entry_function(disassembly: &str, function_name: &str) -> RuntimeResult<ParsedFunction> {
+fn parse_function_by_name(disassembly: &str, function_name: &str) -> RuntimeResult<ParsedFunction> {
     let lines: Vec<&str> = disassembly.lines().collect();
     let mut i = 0usize;
     while i < lines.len() {
@@ -581,13 +685,26 @@ fn parse_entry_function(disassembly: &str, function_name: &str) -> RuntimeResult
             let parsed_name = parse_function_name(line)?;
             if parsed_name == function_name {
                 let param_types = parse_param_types(line)?;
+                let return_count = parse_return_count(line)?;
                 let mut instructions = Vec::new();
                 i += 1;
                 while i < lines.len() {
                     let cur = lines[i].trim();
                     if cur == "}" {
+                        let max_local = instructions
+                            .iter()
+                            .filter_map(|(_, op)| match op {
+                                SuiOpcode::MoveLoc(idx)
+                                | SuiOpcode::CopyLoc(idx)
+                                | SuiOpcode::StLoc(idx) => Some(*idx),
+                                _ => None,
+                            })
+                            .max()
+                            .unwrap_or(0);
                         return Ok(ParsedFunction {
+                            locals_count: usize::max(param_types.len(), max_local + 1),
                             param_types,
+                            return_count,
                             instructions,
                         });
                     }
@@ -618,8 +735,7 @@ fn is_function_header(line: &str) -> bool {
     if line.starts_with("struct ") || line.starts_with("Constants ") {
         return false;
     }
-    let lower = line.to_ascii_lowercase();
-    lower.starts_with("entry ") || lower.starts_with("public ") || line.starts_with("init(")
+    true
 }
 
 fn parse_function_name(line: &str) -> RuntimeResult<String> {
@@ -658,6 +774,19 @@ fn parse_param_types(line: &str) -> RuntimeResult<Vec<String>> {
         out.push(ty.trim().to_string());
     }
     Ok(out)
+}
+
+fn parse_return_count(line: &str) -> RuntimeResult<usize> {
+    let close = line.rfind(')').ok_or_else(|| {
+        RuntimeError::ProgramExecution("Malformed function header: missing ')'".to_string())
+    })?;
+    let suffix = line[close + 1..].trim();
+    let suffix = suffix.strip_suffix('{').unwrap_or(suffix).trim();
+    let returns = suffix.strip_prefix(':').unwrap_or(suffix).trim();
+    if returns.is_empty() {
+        return Ok(0);
+    }
+    Ok(split_top_level(returns, '*').len())
 }
 
 fn parse_instruction(line: &str) -> RuntimeResult<Option<(usize, SuiOpcode)>> {
@@ -879,6 +1008,67 @@ B0:
 }
 "#;
 
+    const HELPER_CALL_DISASSEMBLY: &str = r#"
+mint_to(treasury_cap#0#0: &mut TreasuryCap<MY_COIN>, amount#0#0: u64, recipient#0#0: address, ctx#0#0: &mut TxContext) {
+B0:
+	0: MoveLoc[0](treasury_cap#0#0: &mut TreasuryCap<MY_COIN>)
+	1: MoveLoc[1](amount#0#0: u64)
+	2: MoveLoc[3](ctx#0#0: &mut TxContext)
+	3: Call coin::mint<MY_COIN>(&mut TreasuryCap<MY_COIN>, u64, &mut TxContext): Coin<MY_COIN>
+	4: MoveLoc[2](recipient#0#0: address)
+	5: Call transfer::public_transfer<Coin<MY_COIN>>(Coin<MY_COIN>, address)
+	6: Ret
+}
+
+maybe_mint_to(treasury_cap#0#0: &mut TreasuryCap<MY_COIN>, amount#0#0: u64, recipient#0#0: address, should_transfer#0#0: bool, ctx#0#0: &mut TxContext) {
+B0:
+	0: MoveLoc[3](should_transfer#0#0: bool)
+	1: BrFalse(8)
+B1:
+	2: MoveLoc[0](treasury_cap#0#0: &mut TreasuryCap<MY_COIN>)
+	3: MoveLoc[1](amount#0#0: u64)
+	4: MoveLoc[2](recipient#0#0: address)
+	5: MoveLoc[4](ctx#0#0: &mut TxContext)
+	6: Call mint_to(&mut TreasuryCap<MY_COIN>, u64, address, &mut TxContext)
+	7: Branch(12)
+B2:
+	8: MoveLoc[0](treasury_cap#0#0: &mut TreasuryCap<MY_COIN>)
+	9: Pop
+	10: MoveLoc[4](ctx#0#0: &mut TxContext)
+	11: Pop
+B3:
+	12: Ret
+}
+
+entry public complex_flow(treasury_cap#0#0: &mut TreasuryCap<MY_COIN>, amount#0#0: u64, recipient#0#0: address, should_transfer#0#0: bool, ctx#0#0: &mut TxContext) {
+B0:
+	0: MoveLoc[0](treasury_cap#0#0: &mut TreasuryCap<MY_COIN>)
+	1: MoveLoc[1](amount#0#0: u64)
+	2: MoveLoc[2](recipient#0#0: address)
+	3: MoveLoc[3](should_transfer#0#0: bool)
+	4: MoveLoc[4](ctx#0#0: &mut TxContext)
+	5: Call maybe_mint_to(&mut TreasuryCap<MY_COIN>, u64, address, bool, &mut TxContext)
+	6: Ret
+}
+
+burn_inner(treasury_cap#0#0: &mut TreasuryCap<MY_COIN>, coin#0#0: Coin<MY_COIN>) {
+B0:
+	0: MoveLoc[0](treasury_cap#0#0: &mut TreasuryCap<MY_COIN>)
+	1: MoveLoc[1](coin#0#0: Coin<MY_COIN>)
+	2: Call coin::burn<MY_COIN>(&mut TreasuryCap<MY_COIN>, Coin<MY_COIN>): u64
+	3: Pop
+	4: Ret
+}
+
+entry public burn_via_helper(treasury_cap#0#0: &mut TreasuryCap<MY_COIN>, coin#0#0: Coin<MY_COIN>) {
+B0:
+	0: MoveLoc[0](treasury_cap#0#0: &mut TreasuryCap<MY_COIN>)
+	1: MoveLoc[1](coin#0#0: Coin<MY_COIN>)
+	2: Call burn_inner(&mut TreasuryCap<MY_COIN>, Coin<MY_COIN>)
+	3: Ret
+}
+"#;
+
     #[test]
     fn test_execute_conditional_transfer_subset() {
         let mut state = InMemoryStateStore::new();
@@ -941,6 +1131,61 @@ B0:
             &alice,
             DISASSEMBLY,
             "burn",
+            &[SuiVmArg::Opaque, SuiVmArg::ObjectId(bob_coin_id)],
+        )
+        .unwrap();
+
+        assert!(state.get_object(&bob_coin_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_execute_user_defined_helper_calls() {
+        let mut state = InMemoryStateStore::new();
+        let alice = Address::from_str_id("alice");
+        let bob = Address::from_str_id("bob");
+
+        execute_sui_entry_from_disassembly(
+            &mut state,
+            &alice,
+            HELPER_CALL_DISASSEMBLY,
+            "complex_flow",
+            &[
+                SuiVmArg::Opaque,
+                SuiVmArg::U64(75),
+                SuiVmArg::Address(bob),
+                SuiVmArg::Bool(true),
+                SuiVmArg::Opaque,
+            ],
+        )
+        .unwrap();
+
+        let bob_coin_id = deterministic_coin_id(&bob, "MY_COIN");
+        let bob_coin = state.get_object(&bob_coin_id).unwrap().unwrap();
+        assert_eq!(bob_coin.data.balance.value(), 75);
+
+        execute_sui_entry_from_disassembly(
+            &mut state,
+            &alice,
+            HELPER_CALL_DISASSEMBLY,
+            "complex_flow",
+            &[
+                SuiVmArg::Opaque,
+                SuiVmArg::U64(25),
+                SuiVmArg::Address(bob),
+                SuiVmArg::Bool(false),
+                SuiVmArg::Opaque,
+            ],
+        )
+        .unwrap();
+
+        let bob_coin_after = state.get_object(&bob_coin_id).unwrap().unwrap();
+        assert_eq!(bob_coin_after.data.balance.value(), 75);
+
+        execute_sui_entry_from_disassembly(
+            &mut state,
+            &alice,
+            HELPER_CALL_DISASSEMBLY,
+            "burn_via_helper",
             &[SuiVmArg::Opaque, SuiVmArg::ObjectId(bob_coin_id)],
         )
         .unwrap();

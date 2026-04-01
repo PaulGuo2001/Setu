@@ -338,7 +338,7 @@ impl<S: StateStore> RuntimeExecutor<S> {
         })
     }
 
-    /// 执行 Sui Program 交易（通过 sui_vm 子集解释器）
+    /// 执行 Sui Program 交易
     fn execute_program(
         &mut self,
         tx: &Transaction,
