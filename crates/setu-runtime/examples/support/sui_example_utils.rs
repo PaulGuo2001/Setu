@@ -1,16 +1,142 @@
 use std::fs;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use setu_runtime::{ExecutionContext, RuntimeExecutor, StateStore, SuiVmArg, Transaction};
-use setu_types::{deterministic_coin_id, Address, CoinData, Object};
+use setu_types::{deterministic_coin_id, Address, CoinData, Object, ObjectId};
+use tempfile::TempDir;
+
+pub struct ExampleState<S: StateStore> {
+    pub executor: RuntimeExecutor<S>,
+    pub persistent_dir: Option<TempDir>,
+    pub persistent_path: Option<PathBuf>,
+}
+
+impl<S: StateStore> ExampleState<S> {
+    pub fn new(executor: RuntimeExecutor<S>) -> Self {
+        Self {
+            executor,
+            persistent_dir: None,
+            persistent_path: None,
+        }
+    }
+
+    pub fn with_persistent_dir(
+        executor: RuntimeExecutor<S>,
+        persistent_dir: TempDir,
+        persistent_path: PathBuf,
+    ) -> Self {
+        Self {
+            executor,
+            persistent_dir: Some(persistent_dir),
+            persistent_path: Some(persistent_path),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExampleArgs {
+    pub executor_id: String,
+    pub disassembly: Option<String>,
+    pub addresses: BTreeMap<String, Address>,
+    pub object_ids: BTreeMap<String, ObjectId>,
+    pub strings: BTreeMap<String, String>,
+    pub numbers: BTreeMap<String, u64>,
+    pub bools: BTreeMap<String, bool>,
+}
+
+impl ExampleArgs {
+    pub fn new(executor_id: impl Into<String>) -> Self {
+        Self {
+            executor_id: executor_id.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_disassembly(mut self, disassembly: String) -> Self {
+        self.disassembly = Some(disassembly);
+        self
+    }
+
+    pub fn insert_address(&mut self, key: impl Into<String>, value: Address) {
+        self.addresses.insert(key.into(), value);
+    }
+
+    pub fn insert_object_id(&mut self, key: impl Into<String>, value: ObjectId) {
+        self.object_ids.insert(key.into(), value);
+    }
+
+    pub fn insert_string(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.strings.insert(key.into(), value.into());
+    }
+
+    pub fn insert_number(&mut self, key: impl Into<String>, value: u64) {
+        self.numbers.insert(key.into(), value);
+    }
+
+    pub fn insert_bool(&mut self, key: impl Into<String>, value: bool) {
+        self.bools.insert(key.into(), value);
+    }
+
+    pub fn address(&self, key: &str) -> Result<Address> {
+        self.addresses
+            .get(key)
+            .copied()
+            .with_context(|| format!("missing address '{}'", key))
+    }
+
+    pub fn object_id(&self, key: &str) -> Result<ObjectId> {
+        self.object_ids
+            .get(key)
+            .copied()
+            .with_context(|| format!("missing object id '{}'", key))
+    }
+
+    pub fn string(&self, key: &str) -> Result<&str> {
+        self.strings
+            .get(key)
+            .map(String::as_str)
+            .with_context(|| format!("missing string '{}'", key))
+    }
+
+    pub fn number(&self, key: &str) -> Result<u64> {
+        self.numbers
+            .get(key)
+            .copied()
+            .with_context(|| format!("missing number '{}'", key))
+    }
+
+    pub fn bool(&self, key: &str) -> Result<bool> {
+        self.bools
+            .get(key)
+            .copied()
+            .with_context(|| format!("missing bool '{}'", key))
+    }
+
+    pub fn disassembly(&self) -> Result<&str> {
+        self.disassembly
+            .as_deref()
+            .context("missing contract disassembly")
+    }
+}
 
 pub struct ProgramCall<'a> {
     pub function_name: &'a str,
     pub args: Vec<SuiVmArg>,
     pub timestamp: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgramCallSpec {
+    pub sender: Address,
+    pub disassembly: String,
+    pub function_name: String,
+    pub args: Vec<SuiVmArg>,
+    pub timestamp: u64,
+    pub executor_id: String,
 }
 
 pub fn execute_program_tx<S: StateStore>(
@@ -62,6 +188,31 @@ pub fn execute_program_calls<S: StateStore>(
     }
 
     Ok(())
+}
+
+pub fn execute_program_scenario<S: StateStore>(
+    mut state: ExampleState<S>,
+    calls: &[ProgramCallSpec],
+) -> Result<ExampleState<S>> {
+    for call in calls {
+        execute_program_tx(
+            &mut state.executor,
+            &call.sender,
+            &call.disassembly,
+            &call.function_name,
+            call.args.clone(),
+            call.timestamp,
+            &call.executor_id,
+        )?;
+    }
+
+    state
+        .executor
+        .state_mut()
+        .commit_pending()
+        .context("Failed to commit scenario state")?;
+
+    Ok(state)
 }
 
 #[allow(dead_code)]

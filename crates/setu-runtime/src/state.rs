@@ -45,6 +45,14 @@ pub trait StateStore {
         )))
     }
 
+    /// Finalize pending writes after a scenario step or batch completes.
+    ///
+    /// In-memory stores can treat this as a no-op, while persistent backends
+    /// can use it to durably commit staged state.
+    fn commit_pending(&mut self) -> RuntimeResult<()> {
+        Ok(())
+    }
+
     /// Check if object exists
     fn exists(&self, object_id: &ObjectId) -> bool {
         self.get_object(object_id).ok().flatten().is_some()
@@ -319,6 +327,11 @@ impl<S: StateStore> StateStore for OverlayStateStore<S> {
         self.overlay.delete_vm_object(object_id)?;
         self.deleted_vm_objects.insert(*object_id);
         Ok(())
+    }
+
+    fn commit_pending(&mut self) -> RuntimeResult<()> {
+        self.flush_to_base()?;
+        self.base.commit_pending()
     }
 }
 

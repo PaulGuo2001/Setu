@@ -184,4 +184,8 @@ impl StateStore for SetuMerkleStateStore {
             .apply_state_change(self.subnet_id, &change);
         Ok(())
     }
+
+    fn commit_pending(&mut self) -> RuntimeResult<()> {
+        SetuMerkleStateStore::commit_pending(self).map(|_| ())
+    }
 }

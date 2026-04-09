@@ -5,8 +5,10 @@ use anyhow::{bail, Context, Result};
 use setu_runtime::{
     compile_package_to_disassembly, InMemoryStateStore, RuntimeExecutor, StateStore, SuiVmArg,
 };
-use setu_types::{deterministic_coin_id, Address};
-use sui_example_utils::{create_temp_package_with_contract, execute_program_calls, ProgramCall};
+use setu_types::deterministic_coin_id;
+use sui_example_utils::{
+    create_temp_package_with_contract, execute_program_scenario, ExampleState, ProgramCallSpec,
+};
 
 const CONTRACT: &str = r#"module burn_or_redirect::burn_or_redirect {
     use sui::coin::{Self, Coin, TreasuryCap};
@@ -87,17 +89,7 @@ const CONTRACT: &str = r#"module burn_or_redirect::burn_or_redirect {
     }
 }"#;
 
-struct BurnOrRedirectExample {
-    executor: RuntimeExecutor<InMemoryStateStore>,
-    sender: Address,
-    bob: Address,
-    carol: Address,
-    dave: Address,
-    eve: Address,
-    disassembly: String,
-}
-
-fn setup_state() -> Result<BurnOrRedirectExample> {
+fn setup_state() -> Result<(ExampleState<InMemoryStateStore>, Vec<ProgramCallSpec>)> {
     let pkg =
         create_temp_package_with_contract("burn_or_redirect", "burn_or_redirect.move", CONTRACT)?;
     println!("Created package: {}", pkg.display());
@@ -106,90 +98,93 @@ fn setup_state() -> Result<BurnOrRedirectExample> {
         .context("Failed to compile burn_or_redirect package")?;
     println!("Compiled + disassembled module: burn_or_redirect");
 
-    Ok(BurnOrRedirectExample {
-        executor: RuntimeExecutor::new(InMemoryStateStore::new()),
-        sender: Address::from_str_id("claims_operator"),
-        bob: Address::from_str_id("bob"),
-        carol: Address::from_str_id("carol"),
-        dave: Address::from_str_id("dave"),
-        eve: Address::from_str_id("eve"),
-        disassembly,
-    })
-}
-
-fn execute_scenario(example: &mut BurnOrRedirectExample) -> Result<()> {
-    let coin_type = "BURN_OR_REDIRECT";
-    let bob_coin_id = deterministic_coin_id(&example.bob, coin_type);
-    let carol_coin_id = deterministic_coin_id(&example.carol, coin_type);
-
-    let calls = [
-        ProgramCall {
-            function_name: "issue_claimable",
+    let sender = setu_types::Address::from_str_id("claims_operator");
+    let bob = setu_types::Address::from_str_id("bob");
+    let carol = setu_types::Address::from_str_id("carol");
+    let dave = setu_types::Address::from_str_id("dave");
+    let eve = setu_types::Address::from_str_id("eve");
+    let calls = vec![
+        ProgramCallSpec {
+            sender,
+            disassembly: disassembly.clone(),
+            function_name: "issue_claimable".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
                 SuiVmArg::U64(30),
-                SuiVmArg::Address(example.bob),
+                SuiVmArg::Address(bob),
                 SuiVmArg::Opaque,
             ],
             timestamp: 1,
+            executor_id: "burn_or_redirect".to_string(),
         },
-        ProgramCall {
-            function_name: "issue_claimable",
+        ProgramCallSpec {
+            sender,
+            disassembly: disassembly.clone(),
+            function_name: "issue_claimable".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
                 SuiVmArg::U64(12),
-                SuiVmArg::Address(example.carol),
+                SuiVmArg::Address(carol),
                 SuiVmArg::Opaque,
             ],
             timestamp: 2,
+            executor_id: "burn_or_redirect".to_string(),
         },
-        ProgramCall {
-            function_name: "resolve_failed_claim",
+        ProgramCallSpec {
+            sender,
+            disassembly: disassembly.clone(),
+            function_name: "resolve_failed_claim".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
-                SuiVmArg::ObjectId(bob_coin_id),
-                SuiVmArg::Address(example.dave),
+                SuiVmArg::ObjectId(deterministic_coin_id(&bob, "BURN_OR_REDIRECT")),
+                SuiVmArg::Address(dave),
                 SuiVmArg::Bool(false),
             ],
             timestamp: 3,
+            executor_id: "burn_or_redirect".to_string(),
         },
-        ProgramCall {
-            function_name: "resolve_failed_claim",
+        ProgramCallSpec {
+            sender,
+            disassembly,
+            function_name: "resolve_failed_claim".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
-                SuiVmArg::ObjectId(carol_coin_id),
-                SuiVmArg::Address(example.eve),
+                SuiVmArg::ObjectId(deterministic_coin_id(&carol, "BURN_OR_REDIRECT")),
+                SuiVmArg::Address(eve),
                 SuiVmArg::Bool(true),
             ],
             timestamp: 4,
+            executor_id: "burn_or_redirect".to_string(),
         },
     ];
 
-    execute_program_calls(
-        &mut example.executor,
-        &example.sender,
-        &example.disassembly,
-        "burn_or_redirect",
-        &calls,
-    )
+    Ok((
+        ExampleState::new(RuntimeExecutor::new(InMemoryStateStore::new())),
+        calls,
+    ))
 }
 
-fn assert_state(example: &BurnOrRedirectExample) -> Result<()> {
+fn assert_state(state: &ExampleState<InMemoryStateStore>) -> Result<()> {
     let coin_type = "BURN_OR_REDIRECT";
-    let bob_coin_id = deterministic_coin_id(&example.bob, coin_type);
-    let carol_coin_id = deterministic_coin_id(&example.carol, coin_type);
+    let bob_coin_id =
+        deterministic_coin_id(&setu_types::Address::from_str_id("bob"), coin_type);
+    let carol_coin_id =
+        deterministic_coin_id(&setu_types::Address::from_str_id("carol"), coin_type);
 
-    if example.executor.state().get_object(&bob_coin_id)?.is_some() {
+    if state.executor.state().get_object(&bob_coin_id)?.is_some() {
         bail!("bob claim coin should have been redirected away");
     }
-    if example.executor.state().get_object(&carol_coin_id)?.is_some() {
+    if state.executor.state().get_object(&carol_coin_id)?.is_some() {
         bail!("carol claim coin should have been burned");
     }
 
-    let redirected_coin = example
+    let redirected_coin = state
         .executor
         .state()
-        .get_object(&deterministic_coin_id(&example.dave, coin_type))?
+        .get_object(&deterministic_coin_id(
+            &setu_types::Address::from_str_id("dave"),
+            coin_type,
+        ))?
         .context("redirected coin missing for dave")?;
     if redirected_coin.data.balance.value() != 30 {
         bail!(
@@ -198,10 +193,13 @@ fn assert_state(example: &BurnOrRedirectExample) -> Result<()> {
         );
     }
 
-    if example
+    if state
         .executor
         .state()
-        .get_object(&deterministic_coin_id(&example.eve, coin_type))?
+        .get_object(&deterministic_coin_id(
+            &setu_types::Address::from_str_id("eve"),
+            coin_type,
+        ))?
         .is_some()
     {
         bail!("eve should not receive a coin when the claim is burned");
@@ -217,7 +215,7 @@ fn assert_state(example: &BurnOrRedirectExample) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let mut example = setup_state()?;
-    execute_scenario(&mut example)?;
-    assert_state(&example)
+    let (state, calls) = setup_state()?;
+    let state = execute_program_scenario(state, &calls)?;
+    assert_state(&state)
 }

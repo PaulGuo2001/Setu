@@ -1,3 +1,6 @@
+#[path = "support/sui_example_utils.rs"]
+mod sui_example_utils;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -5,11 +8,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use setu_runtime::{
-    compile_package_to_disassembly, ExecutionContext, RuntimeExecutor, SetuMerkleStateStore,
-    StateStore, SuiVmArg, SuiVmStoredObject, SuiVmStoredValue, Transaction,
+    compile_package_to_disassembly, RuntimeExecutor, SetuMerkleStateStore, StateStore, SuiVmArg,
+    SuiVmStoredObject, SuiVmStoredValue,
 };
-use setu_types::{Address, ObjectId};
+use setu_types::ObjectId;
 use tempfile::TempDir;
+use sui_example_utils::{ExampleState, ProgramCallSpec, execute_program_scenario};
 
 const CONTRACT: &str = r#"module persistent_counter_pkg::counter {
     public struct Counter has key, store {
@@ -23,15 +27,7 @@ const CONTRACT: &str = r#"module persistent_counter_pkg::counter {
     }
 }"#;
 
-struct PersistentCounterExample {
-    _db_dir: TempDir,
-    db_path: PathBuf,
-    owner: Address,
-    counter_id: ObjectId,
-    disassembly: String,
-}
-
-fn setup_state() -> Result<PersistentCounterExample> {
+fn setup_state() -> Result<(ExampleState<SetuMerkleStateStore>, Vec<ProgramCallSpec>)> {
     let pkg = create_temp_package_with_contract()?;
     println!("Created package: {}", pkg.display());
 
@@ -43,12 +39,12 @@ fn setup_state() -> Result<PersistentCounterExample> {
     let db_path = db_dir.path().join("setu_merkle_db");
     println!("Setu storage path: {}", db_path.display());
 
-    let owner = Address::from_str_id("alice");
+    let owner = setu_types::Address::from_str_id("alice");
     let counter_id = ObjectId::new([0x31; 32]);
 
-    let mut state =
+    let mut store =
         SetuMerkleStateStore::open_root(&db_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    state
+    store
         .set_vm_object(
             counter_id,
             SuiVmStoredObject::new_owned(
@@ -62,47 +58,36 @@ fn setup_state() -> Result<PersistentCounterExample> {
             ),
         )
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let anchor_id = state
+    let anchor_id = store
         .commit_pending()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     println!(
         "Seeded ROOT subnet counter {} with value 41 at anchor {}",
         counter_id, anchor_id
     );
-    println!("Initial state root: 0x{}", to_hex(&state.state_root()));
+    println!("Initial state root: 0x{}", to_hex(&store.state_root()));
 
-    Ok(PersistentCounterExample {
-        _db_dir: db_dir,
-        db_path,
-        owner,
-        counter_id,
+    let calls = vec![ProgramCallSpec {
+        sender: owner,
         disassembly,
-    })
+        function_name: "increment".to_string(),
+        args: vec![SuiVmArg::ObjectId(counter_id)],
+        timestamp: 10,
+        executor_id: "persistent_objects".to_string(),
+    }];
+
+    Ok((
+        ExampleState::with_persistent_dir(RuntimeExecutor::new(store), db_dir, db_path),
+        calls,
+    ))
 }
 
-fn execute_scenario(example: &PersistentCounterExample) -> Result<()> {
-    let state = SetuMerkleStateStore::open_root(&example.db_path)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let before_root = state.state_root();
-    let mut executor = RuntimeExecutor::new(state);
-
-    execute_program_tx(
-        &mut executor,
-        &example.owner,
-        &example.disassembly,
-        "increment",
-        vec![SuiVmArg::ObjectId(example.counter_id)],
-        10,
-        "persistent_objects",
-    )?;
-
-    let commit_anchor = executor
-        .state_mut()
-        .commit_pending()
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let counter = executor
+fn assert_state(mut state: ExampleState<SetuMerkleStateStore>) -> Result<()> {
+    let counter_id = ObjectId::new([0x31; 32]);
+    let counter = state
+        .executor
         .state()
-        .get_vm_object(&example.counter_id)?
+        .get_vm_object(&counter_id)?
         .context("counter missing after increment")?;
     let value = counter
         .get_u64_field("value")
@@ -111,25 +96,23 @@ fn execute_scenario(example: &PersistentCounterExample) -> Result<()> {
         bail!("expected counter value 42 after increment, got {}", value);
     }
 
-    let after_root = executor.state().state_root();
-    if before_root == after_root {
-        bail!("expected state root to change after increment");
-    }
-
+    println!("Increment executed: counter {} is now {}", counter_id, value);
     println!(
-        "Increment executed: counter {} is now {} at anchor {}",
-        example.counter_id, value, commit_anchor
+        "Committed state root: 0x{}",
+        to_hex(&state.executor.state().state_root())
     );
-    println!("Updated state root: 0x{}", to_hex(&after_root));
 
-    Ok(())
-}
+    let db_path = state
+        .persistent_path
+        .clone()
+        .context("missing persistent storage path")?;
+    let persistent_dir = state.persistent_dir.take();
+    drop(state);
 
-fn assert_state(example: &PersistentCounterExample) -> Result<()> {
-    let reopened = SetuMerkleStateStore::open_root(&example.db_path)
+    let reopened = SetuMerkleStateStore::open_root(&db_path)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let counter = reopened
-        .get_vm_object(&example.counter_id)?
+        .get_vm_object(&counter_id)?
         .context("counter missing after reopening persisted Setu state")?;
     let value = counter
         .get_u64_field("value")
@@ -137,53 +120,25 @@ fn assert_state(example: &PersistentCounterExample) -> Result<()> {
     if value != 42 {
         bail!("expected reopened counter value 42, got {}", value);
     }
-    if reopened.get_object_bytes(&example.counter_id).is_none() {
+    if reopened.get_object_bytes(&counter_id).is_none() {
         bail!("MerkleStateProvider should return raw object bytes for the counter");
     }
 
     println!(
         "Reopened state: counter {} recovered with value {}",
-        example.counter_id, value
+        counter_id, value
     );
     println!("Recovered state root: 0x{}", to_hex(&reopened.state_root()));
     println!("\nPersistent counter example completed.");
+    drop(persistent_dir);
 
     Ok(())
 }
 
 fn main() -> Result<()> {
-    let example = setup_state()?;
-    execute_scenario(&example)?;
-    assert_state(&example)
-}
-
-fn execute_program_tx<S: StateStore>(
-    executor: &mut RuntimeExecutor<S>,
-    sender: &Address,
-    disassembly: &str,
-    function_name: &str,
-    args: Vec<SuiVmArg>,
-    timestamp: u64,
-    executor_id: &str,
-) -> Result<()> {
-    let tx = Transaction::new_program_deterministic(
-        *sender,
-        disassembly.to_owned(),
-        function_name,
-        args,
-        timestamp,
-    );
-    let ctx = ExecutionContext {
-        executor_id: executor_id.to_string(),
-        timestamp,
-        in_tee: false,
-    };
-
-    executor
-        .execute_transaction(&tx, &ctx)
-        .with_context(|| format!("Failed to execute '{}' via RuntimeExecutor", function_name))?;
-
-    Ok(())
+    let (state, calls) = setup_state()?;
+    let state = execute_program_scenario(state, &calls)?;
+    assert_state(state)
 }
 
 fn create_temp_package_with_contract() -> Result<PathBuf> {

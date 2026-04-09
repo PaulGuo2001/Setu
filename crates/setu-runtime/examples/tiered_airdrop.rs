@@ -5,9 +5,9 @@ use anyhow::{Context, Result};
 use setu_runtime::{
     compile_package_to_disassembly, InMemoryStateStore, RuntimeExecutor, SuiVmArg,
 };
-use setu_types::Address;
 use sui_example_utils::{
-    create_temp_package_with_contract, execute_program_calls, expect_coin_balance, ProgramCall,
+    create_temp_package_with_contract, execute_program_scenario, expect_coin_balance, ExampleState,
+    ProgramCallSpec,
 };
 
 const CONTRACT: &str = r#"module tiered_airdrop::tiered_airdrop {
@@ -86,16 +86,7 @@ const CONTRACT: &str = r#"module tiered_airdrop::tiered_airdrop {
     }
 }"#;
 
-struct TieredAirdropExample {
-    executor: RuntimeExecutor<InMemoryStateStore>,
-    sender: Address,
-    bob: Address,
-    carol: Address,
-    dave: Address,
-    disassembly: String,
-}
-
-fn setup_state() -> Result<TieredAirdropExample> {
+fn setup_state() -> Result<(ExampleState<InMemoryStateStore>, Vec<ProgramCallSpec>)> {
     let pkg = create_temp_package_with_contract("tiered_airdrop", "tiered_airdrop.move", CONTRACT)?;
     println!("Created package: {}", pkg.display());
 
@@ -103,92 +94,94 @@ fn setup_state() -> Result<TieredAirdropExample> {
         .context("Failed to compile tiered_airdrop package")?;
     println!("Compiled + disassembled module: tiered_airdrop");
 
-    Ok(TieredAirdropExample {
-        executor: RuntimeExecutor::new(InMemoryStateStore::new()),
-        sender: Address::from_str_id("campaign_owner"),
-        bob: Address::from_str_id("bob"),
-        carol: Address::from_str_id("carol"),
-        dave: Address::from_str_id("dave"),
-        disassembly,
-    })
-}
-
-fn execute_scenario(example: &mut TieredAirdropExample) -> Result<()> {
-    let calls = [
-        ProgramCall {
-            function_name: "distribute_campaign_rewards",
+    let sender = setu_types::Address::from_str_id("campaign_owner");
+    let bob = setu_types::Address::from_str_id("bob");
+    let carol = setu_types::Address::from_str_id("carol");
+    let dave = setu_types::Address::from_str_id("dave");
+    let calls = vec![
+        ProgramCallSpec {
+            sender,
+            disassembly: disassembly.clone(),
+            function_name: "distribute_campaign_rewards".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
-                SuiVmArg::Address(example.bob),
+                SuiVmArg::Address(bob),
                 SuiVmArg::Bool(true),
                 SuiVmArg::Bool(true),
                 SuiVmArg::Opaque,
             ],
             timestamp: 1,
+            executor_id: "tiered_airdrop".to_string(),
         },
-        ProgramCall {
-            function_name: "distribute_campaign_rewards",
+        ProgramCallSpec {
+            sender,
+            disassembly: disassembly.clone(),
+            function_name: "distribute_campaign_rewards".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
-                SuiVmArg::Address(example.carol),
+                SuiVmArg::Address(carol),
                 SuiVmArg::Bool(false),
                 SuiVmArg::Bool(true),
                 SuiVmArg::Opaque,
             ],
             timestamp: 2,
+            executor_id: "tiered_airdrop".to_string(),
         },
-        ProgramCall {
-            function_name: "distribute_campaign_rewards",
+        ProgramCallSpec {
+            sender,
+            disassembly: disassembly.clone(),
+            function_name: "distribute_campaign_rewards".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
-                SuiVmArg::Address(example.dave),
+                SuiVmArg::Address(dave),
                 SuiVmArg::Bool(false),
                 SuiVmArg::Bool(false),
                 SuiVmArg::Opaque,
             ],
             timestamp: 3,
+            executor_id: "tiered_airdrop".to_string(),
         },
-        ProgramCall {
-            function_name: "distribute_campaign_rewards",
+        ProgramCallSpec {
+            sender,
+            disassembly,
+            function_name: "distribute_campaign_rewards".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
-                SuiVmArg::Address(example.bob),
+                SuiVmArg::Address(bob),
                 SuiVmArg::Bool(false),
                 SuiVmArg::Bool(true),
                 SuiVmArg::Opaque,
             ],
             timestamp: 4,
+            executor_id: "tiered_airdrop".to_string(),
         },
     ];
 
-    execute_program_calls(
-        &mut example.executor,
-        &example.sender,
-        &example.disassembly,
-        "tiered_airdrop",
-        &calls,
-    )
+    Ok((
+        ExampleState::new(RuntimeExecutor::new(InMemoryStateStore::new())),
+        calls,
+    ))
 }
 
-fn assert_state(example: &TieredAirdropExample) -> Result<()> {
+fn assert_state(state: &ExampleState<InMemoryStateStore>) -> Result<()> {
     let coin_type = "TIERED_AIRDROP";
     let bob_coin = expect_coin_balance(
-        example.executor.state(),
-        &example.bob,
+        state.executor.state(),
+        &setu_types::Address::from_str_id("bob"),
         coin_type,
         145,
         "bob reward",
     )?;
     let carol_coin = expect_coin_balance(
-        example.executor.state(),
-        &example.carol,
+        state.executor.state(),
+        &setu_types::Address::from_str_id("carol"),
         coin_type,
         60,
         "carol reward",
     )?;
     let dave_coin = expect_coin_balance(
-        example.executor.state(),
-        &example.dave,
+        state.executor.state(),
+        &setu_types::Address::from_str_id("dave"),
         coin_type,
         50,
         "dave reward",
@@ -202,7 +195,7 @@ fn assert_state(example: &TieredAirdropExample) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let mut example = setup_state()?;
-    execute_scenario(&mut example)?;
-    assert_state(&example)
+    let (state, calls) = setup_state()?;
+    let state = execute_program_scenario(state, &calls)?;
+    assert_state(&state)
 }

@@ -10,8 +10,8 @@ use anyhow::{bail, Context, Result};
 use setu_runtime::{
     compile_package_to_disassembly, InMemoryStateStore, RuntimeExecutor, StateStore, SuiVmArg,
 };
-use setu_types::{deterministic_coin_id, Address};
-use sui_example_utils::{execute_program_calls, ProgramCall};
+use setu_types::deterministic_coin_id;
+use sui_example_utils::{ExampleState, ProgramCallSpec, execute_program_scenario};
 
 const CONTRACT: &str = r#"module my_coin_pkg::my_coin {
     use sui::coin::{Self, Coin, TreasuryCap};
@@ -112,15 +112,7 @@ const CONTRACT: &str = r#"module my_coin_pkg::my_coin {
     }
 }"#;
 
-struct SuiContractExample {
-    executor: RuntimeExecutor<InMemoryStateStore>,
-    sender: Address,
-    recipient: Address,
-    third_recipient: Address,
-    disassembly: String,
-}
-
-fn setup_state() -> Result<SuiContractExample> {
+fn setup_state() -> Result<(ExampleState<InMemoryStateStore>, Vec<ProgramCallSpec>)> {
     let pkg = create_temp_package_with_contract()?;
     println!("Created package: {}", pkg.display());
 
@@ -128,79 +120,82 @@ fn setup_state() -> Result<SuiContractExample> {
         .context("Failed to compile and disassemble Sui contract")?;
     println!("Compiled + disassembled module: my_coin");
 
-    Ok(SuiContractExample {
-        executor: RuntimeExecutor::new(InMemoryStateStore::new()),
-        sender: Address::from_str_id("alice"),
-        recipient: Address::from_str_id("bob"),
-        third_recipient: Address::from_str_id("carol"),
-        disassembly,
-    })
-}
-
-fn execute_scenario(example: &mut SuiContractExample) -> Result<()> {
-    let calls = [
-        ProgramCall {
-            function_name: "orchestrate_rewards",
+    let sender = setu_types::Address::from_str_id("alice");
+    let recipient = setu_types::Address::from_str_id("bob");
+    let third_recipient = setu_types::Address::from_str_id("carol");
+    let calls = vec![
+        ProgramCallSpec {
+            sender,
+            disassembly: disassembly.clone(),
+            function_name: "orchestrate_rewards".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
                 SuiVmArg::U64(100),
-                SuiVmArg::Address(example.sender),
+                SuiVmArg::Address(sender),
                 SuiVmArg::U64(40),
-                SuiVmArg::Address(example.recipient),
+                SuiVmArg::Address(recipient),
                 SuiVmArg::Bool(true),
                 SuiVmArg::Opaque,
             ],
             timestamp: 2,
+            executor_id: "sui_contract_e2e".to_string(),
         },
-        ProgramCall {
-            function_name: "orchestrate_rewards",
+        ProgramCallSpec {
+            sender,
+            disassembly: disassembly.clone(),
+            function_name: "orchestrate_rewards".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
                 SuiVmArg::U64(10),
-                SuiVmArg::Address(example.sender),
+                SuiVmArg::Address(sender),
                 SuiVmArg::U64(55),
-                SuiVmArg::Address(example.recipient),
+                SuiVmArg::Address(recipient),
                 SuiVmArg::Bool(false),
                 SuiVmArg::Opaque,
             ],
             timestamp: 3,
+            executor_id: "sui_contract_e2e".to_string(),
         },
-        ProgramCall {
-            function_name: "orchestrate_rewards",
+        ProgramCallSpec {
+            sender,
+            disassembly: disassembly.clone(),
+            function_name: "orchestrate_rewards".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
                 SuiVmArg::U64(15),
-                SuiVmArg::Address(example.recipient),
+                SuiVmArg::Address(recipient),
                 SuiVmArg::U64(5),
-                SuiVmArg::Address(example.third_recipient),
+                SuiVmArg::Address(third_recipient),
                 SuiVmArg::Bool(true),
                 SuiVmArg::Opaque,
             ],
             timestamp: 4,
+            executor_id: "sui_contract_e2e".to_string(),
         },
-        ProgramCall {
-            function_name: "burn_via_helper",
+        ProgramCallSpec {
+            sender,
+            disassembly,
+            function_name: "burn_via_helper".to_string(),
             args: vec![
                 SuiVmArg::Opaque,
-                SuiVmArg::ObjectId(deterministic_coin_id(&example.recipient, "MY_COIN")),
+                SuiVmArg::ObjectId(deterministic_coin_id(&recipient, "MY_COIN")),
             ],
             timestamp: 5,
+            executor_id: "sui_contract_e2e".to_string(),
         },
     ];
 
-    execute_program_calls(
-        &mut example.executor,
-        &example.sender,
-        &example.disassembly,
-        "sui_contract_e2e",
-        &calls,
-    )
+    Ok((
+        ExampleState::new(RuntimeExecutor::new(InMemoryStateStore::new())),
+        calls,
+    ))
 }
 
-fn assert_state(example: &SuiContractExample) -> Result<()> {
+fn assert_state(state: &ExampleState<InMemoryStateStore>) -> Result<()> {
     let coin_type = "MY_COIN";
-    let alice_coin_id = deterministic_coin_id(&example.sender, coin_type);
-    let alice_coin = example
+    let alice_coin_id =
+        deterministic_coin_id(&setu_types::Address::from_str_id("alice"), coin_type);
+    let alice_coin = state
         .executor
         .state()
         .get_object(&alice_coin_id)?
@@ -212,14 +207,16 @@ fn assert_state(example: &SuiContractExample) -> Result<()> {
         );
     }
 
-    let bob_coin_id = deterministic_coin_id(&example.recipient, coin_type);
-    let bob_after_burn = example.executor.state().get_object(&bob_coin_id)?;
+    let bob_coin_id =
+        deterministic_coin_id(&setu_types::Address::from_str_id("bob"), coin_type);
+    let bob_after_burn = state.executor.state().get_object(&bob_coin_id)?;
     if bob_after_burn.is_some() {
         bail!("Burn failed: bob coin still exists");
     }
 
-    let carol_coin_id = deterministic_coin_id(&example.third_recipient, coin_type);
-    let carol_coin = example
+    let carol_coin_id =
+        deterministic_coin_id(&setu_types::Address::from_str_id("carol"), coin_type);
+    let carol_coin = state
         .executor
         .state()
         .get_object(&carol_coin_id)?
@@ -241,9 +238,9 @@ fn assert_state(example: &SuiContractExample) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let mut example = setup_state()?;
-    execute_scenario(&mut example)?;
-    assert_state(&example)
+    let (state, calls) = setup_state()?;
+    let state = execute_program_scenario(state, &calls)?;
+    assert_state(&state)
 }
 
 fn create_temp_package_with_contract() -> Result<PathBuf> {
